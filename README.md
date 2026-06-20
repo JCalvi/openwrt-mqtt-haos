@@ -4,6 +4,10 @@ Publishes OpenWrt router stats to Home Assistant via MQTT discovery.
 
 Tested on GL-MT6000 running Alpine-based OpenWrt.
 
+## Screenshot
+
+![Sensors in Home Assistant](screenshots/Screenshot1.png)
+
 ## Sensors
 
 | Sensor | Update frequency |
