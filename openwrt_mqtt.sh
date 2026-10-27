@@ -1,7 +1,7 @@
 #!/bin/sh
 #
 # OpenWrt WiFi MQTT Publisher for Home Assistant
-# Version: 1.2.1
+# Version: 1.2.3
 #
 # Commands:
 #   /root/openwrt_mqtt.sh install
@@ -11,6 +11,7 @@
 #   /root/openwrt_mqtt.sh all
 #   /root/openwrt_mqtt.sh status
 #   /root/openwrt_mqtt.sh version
+#   /root/openwrt_mqtt.sh install-service  # non-interactive migration
 #
 # Required package:
 #   apk add mosquitto-client-nossl
@@ -22,7 +23,7 @@
 #   /etc/init.d/openwrt_mqtt
 #
 
-VERSION="1.2.1"
+VERSION="1.2.3"
 CONFIG="openwrt_mqtt"
 SCRIPT="/root/openwrt_mqtt.sh"
 SERVICE="/etc/init.d/openwrt_mqtt"
@@ -76,7 +77,7 @@ load_config() {
 
   FW="$(. /etc/openwrt_release 2>/dev/null; echo "$DISTRIB_DESCRIPTION")"
 
-  DEVICE="\"device\":{\"identifiers\":[\"openwrt_${DEVICE_ID}\"],\"name\":\"$(json_escape "$HOSTNAME")\",\"manufacturer\":\"OpenWrt\",\"model\":\"$(json_escape "$MODEL")\",\"sw_version\":\"$(json_escape "$FW\")\"}"
+  DEVICE="\"device\":{\"identifiers\":[\"openwrt_${DEVICE_ID}\"],\"name\":\"$(json_escape "$HOSTNAME")\",\"manufacturer\":\"OpenWrt\",\"model\":\"$(json_escape "$MODEL")\",\"sw_version\":\"$(json_escape "$FW")\"}"
 }
 
 check_requirements() {
@@ -183,6 +184,30 @@ CFG
   echo "Config saved to /etc/config/openwrt_mqtt"
 }
 
+# Preserve our configuration and service files across OpenWrt sysupgrade.
+# Idempotent: retain existing entries/comments and never append duplicates.
+ensure_sysupgrade_config() {
+  KEEP_FILE="/etc/sysupgrade.conf"
+  if [ ! -e "$KEEP_FILE" ]; then
+    : > "$KEEP_FILE" || return 1
+  fi
+  if [ ! -f "$KEEP_FILE" ]; then
+    echo "Cannot update $KEEP_FILE: not a regular file" >&2
+    return 1
+  fi
+  for KEEP_PATH in \
+    /root/openwrt_mqtt.sh \
+    /etc/config/openwrt_mqtt \
+    /etc/init.d/openwrt_mqtt \
+    /etc/rc.local
+  do
+    if ! grep -Fqx "$KEEP_PATH" "$KEEP_FILE"; then
+      printf '%s\n' "$KEEP_PATH" >> "$KEEP_FILE" || return 1
+    fi
+  done
+  echo "Verified sysupgrade preservation entries: $KEEP_FILE"
+}
+
 create_service() {
   cat > "$SERVICE" <<'SVC'
 #!/bin/sh /etc/rc.common
@@ -194,37 +219,55 @@ USE_PROCD=1
 start_service() {
         procd_open_instance
         procd_set_param command /root/openwrt_mqtt.sh daemon
-        procd_set_param respawn 3600 5 5
+        # Retry indefinitely after unexpected failures.
+        procd_set_param respawn 3600 5 0
         procd_set_param stdout 1
         procd_set_param stderr 1
         procd_close_instance
+}
+
+stop_service() {
+        # procd stops may close the persistent publisher cleanly (no MQTT LWT).
+        # Explicitly mark the device offline before stopping it.
+        [ -z "$IPKG_INSTROOT" ] && /root/openwrt_mqtt.sh offline >/dev/null 2>&1 || true
 }
 SVC
 
   chmod +x "$SERVICE"
   "$SERVICE" enable >/dev/null 2>&1
+  ensure_sysupgrade_config || return 1
   echo "Installed service: $SERVICE"
+}
+
+# Keep MQTT discovery failures visible to the daemon so it retries after a
+# late-starting broker instead of leaving missing or stale HA entities.
+discovery_pub() {
+  if ! pub "$@"; then
+    DISCOVERY_FAILED=1
+    return 1
+  fi
 }
 
 do_discovery() {
   load_config
   check_requirements
+  DISCOVERY_FAILED=0
 
   UPTIME_TEMPLATE="{% set s = value_json.uptime | int %}{% if s < 3600 %}{{ s // 60 }}m {{ s % 60 }}s{% elif s < 86400 %}{{ s // 3600 }}h {{ s % 3600 // 60 }}m{% else %}{{ s // 86400 }}d {{ s % 86400 // 3600 }}h{% endif %}"
 
-  pub -r -t "${DISC}/binary_sensor/${DEVICE_ID}_healthy/config" -m "{\"name\":\"WiFi Healthy\",\"unique_id\":\"${DEVICE_ID}_wifi_healthy\",\"state_topic\":\"${BASE}/state\",\"availability_topic\":\"${BASE}/availability\",\"value_template\":\"{{ iif(value_json.healthy, 'true', 'false') }}\",\"payload_on\":\"true\",\"payload_off\":\"false\",\"device_class\":\"connectivity\",${DEVICE}}"
+  discovery_pub -r -t "${DISC}/binary_sensor/${DEVICE_ID}_healthy/config" -m "{\"name\":\"WiFi Healthy\",\"unique_id\":\"${DEVICE_ID}_wifi_healthy\",\"state_topic\":\"${BASE}/state\",\"availability_topic\":\"${BASE}/availability\",\"value_template\":\"{{ iif(value_json.healthy, 'true', 'false') }}\",\"payload_on\":\"true\",\"payload_off\":\"false\",\"device_class\":\"connectivity\",${DEVICE}}"
 
-  pub -r -t "${DISC}/sensor/${DEVICE_ID}_clients_total/config" -m "{\"name\":\"Total Clients\",\"unique_id\":\"${DEVICE_ID}_clients_total\",\"state_topic\":\"${BASE}/state\",\"availability_topic\":\"${BASE}/availability\",\"value_template\":\"{{ value_json.clients_total }}\",\"state_class\":\"measurement\",${DEVICE}}"
+  discovery_pub -r -t "${DISC}/sensor/${DEVICE_ID}_clients_total/config" -m "{\"name\":\"Total Clients\",\"unique_id\":\"${DEVICE_ID}_clients_total\",\"state_topic\":\"${BASE}/state\",\"availability_topic\":\"${BASE}/availability\",\"value_template\":\"{{ value_json.clients_total }}\",\"state_class\":\"measurement\",${DEVICE}}"
 
-  pub -r -t "${DISC}/sensor/${DEVICE_ID}_cpu_temp/config" -m "{\"name\":\"CPU Temperature\",\"unique_id\":\"${DEVICE_ID}_cpu_temp\",\"state_topic\":\"${BASE}/slow_state\",\"availability_topic\":\"${BASE}/availability\",\"value_template\":\"{{ value_json.cpu_temp }}\",\"device_class\":\"temperature\",\"unit_of_measurement\":\"°C\",\"state_class\":\"measurement\",${DEVICE}}"
+  discovery_pub -r -t "${DISC}/sensor/${DEVICE_ID}_cpu_temp/config" -m "{\"name\":\"CPU Temperature\",\"unique_id\":\"${DEVICE_ID}_cpu_temp\",\"state_topic\":\"${BASE}/slow_state\",\"availability_topic\":\"${BASE}/availability\",\"value_template\":\"{{ value_json.cpu_temp }}\",\"device_class\":\"temperature\",\"unit_of_measurement\":\"°C\",\"state_class\":\"measurement\",${DEVICE}}"
 
-  pub -r -t "${DISC}/sensor/${DEVICE_ID}_memory/config" -m "{\"name\":\"Memory Used\",\"unique_id\":\"${DEVICE_ID}_memory_used\",\"state_topic\":\"${BASE}/slow_state\",\"availability_topic\":\"${BASE}/availability\",\"value_template\":\"{{ value_json.memory_used_pct }}\",\"unit_of_measurement\":\"%\",\"state_class\":\"measurement\",${DEVICE}}"
+  discovery_pub -r -t "${DISC}/sensor/${DEVICE_ID}_memory/config" -m "{\"name\":\"Memory Used\",\"unique_id\":\"${DEVICE_ID}_memory_used\",\"state_topic\":\"${BASE}/slow_state\",\"availability_topic\":\"${BASE}/availability\",\"value_template\":\"{{ value_json.memory_used_pct }}\",\"unit_of_measurement\":\"%\",\"state_class\":\"measurement\",${DEVICE}}"
 
-  pub -r -t "${DISC}/sensor/${DEVICE_ID}_load1/config" -m "{\"name\":\"Load 1m\",\"unique_id\":\"${DEVICE_ID}_load1\",\"state_topic\":\"${BASE}/slow_state\",\"availability_topic\":\"${BASE}/availability\",\"value_template\":\"{{ value_json.load1 }}\",${DEVICE}}"
+  discovery_pub -r -t "${DISC}/sensor/${DEVICE_ID}_load1/config" -m "{\"name\":\"Load 1m\",\"unique_id\":\"${DEVICE_ID}_load1\",\"state_topic\":\"${BASE}/slow_state\",\"availability_topic\":\"${BASE}/availability\",\"value_template\":\"{{ value_json.load1 }}\",${DEVICE}}"
 
-  pub -r -t "${DISC}/sensor/${DEVICE_ID}_uptime/config" -m "{\"name\":\"Uptime\",\"unique_id\":\"${DEVICE_ID}_uptime\",\"state_topic\":\"${BASE}/slow_state\",\"availability_topic\":\"${BASE}/availability\",\"value_template\":\"$(json_escape "$UPTIME_TEMPLATE")\",\"icon\":\"mdi:timer-outline\",${DEVICE}}"
+  discovery_pub -r -t "${DISC}/sensor/${DEVICE_ID}_uptime/config" -m "{\"name\":\"Uptime\",\"unique_id\":\"${DEVICE_ID}_uptime\",\"state_topic\":\"${BASE}/slow_state\",\"availability_topic\":\"${BASE}/availability\",\"value_template\":\"$(json_escape "$UPTIME_TEMPLATE")\",\"icon\":\"mdi:timer-outline\",${DEVICE}}"
 
-  wifi_list | while IFS='|' read -r IFACE SSID BAND; do
+  if ! wifi_list | while IFS='|' read -r IFACE SSID BAND; do
     [ -z "$IFACE" ] && continue
     [ -z "$SSID" ] && continue
 
@@ -233,10 +276,14 @@ do_discovery() {
     SSID_ID="$(safe_id "${SSID}-${BAND}")"
     SSID_NAME="$(json_escape "$SSID")"
 
-    pub -r -t "${DISC}/binary_sensor/${DEVICE_ID}_${SSID_ID}_up/config" -m "{\"name\":\"${SSID_NAME} ${BAND_NAME} Up\",\"unique_id\":\"${DEVICE_ID}_${SSID_ID}_up\",\"state_topic\":\"${BASE}/ssid/${SSID_ID}/state\",\"availability_topic\":\"${BASE}/availability\",\"value_template\":\"{{ iif(value_json.up, 'true', 'false') }}\",\"payload_on\":\"true\",\"payload_off\":\"false\",\"device_class\":\"connectivity\",${DEVICE}}"
+    discovery_pub -r -t "${DISC}/binary_sensor/${DEVICE_ID}_${SSID_ID}_up/config" -m "{\"name\":\"${SSID_NAME} ${BAND_NAME} Up\",\"unique_id\":\"${DEVICE_ID}_${SSID_ID}_up\",\"state_topic\":\"${BASE}/ssid/${SSID_ID}/state\",\"availability_topic\":\"${BASE}/availability\",\"value_template\":\"{{ iif(value_json.up, 'true', 'false') }}\",\"payload_on\":\"true\",\"payload_off\":\"false\",\"device_class\":\"connectivity\",${DEVICE}}" || exit 1
 
-    pub -r -t "${DISC}/sensor/${DEVICE_ID}_${SSID_ID}_clients/config" -m "{\"name\":\"${SSID_NAME} ${BAND_NAME} Clients\",\"unique_id\":\"${DEVICE_ID}_${SSID_ID}_clients\",\"state_topic\":\"${BASE}/ssid/${SSID_ID}/state\",\"availability_topic\":\"${BASE}/availability\",\"value_template\":\"{{ value_json.clients }}\",\"state_class\":\"measurement\",${DEVICE}}"
-  done
+    discovery_pub -r -t "${DISC}/sensor/${DEVICE_ID}_${SSID_ID}_clients/config" -m "{\"name\":\"${SSID_NAME} ${BAND_NAME} Clients\",\"unique_id\":\"${DEVICE_ID}_${SSID_ID}_clients\",\"state_topic\":\"${BASE}/ssid/${SSID_ID}/state\",\"availability_topic\":\"${BASE}/availability\",\"value_template\":\"{{ value_json.clients }}\",\"state_class\":\"measurement\",${DEVICE}}" || exit 1
+  done; then
+    DISCOVERY_FAILED=1
+  fi
+
+  [ "$DISCOVERY_FAILED" -eq 0 ]
 }
 
 build_state() {
@@ -275,13 +322,15 @@ build_slow_state() {
 }
 
 publish_state() {
-  pub -r -t "${BASE}/availability" -m "online"
-  pub -r -t "${BASE}/state" -m "$STATE"
+  FAILED=0
+  pub -r -t "${BASE}/state" -m "$STATE" || FAILED=1
 
-  echo "$SSID_STATE" | while IFS='|' read -r SSID_ID SSID BAND IFACE CLIENTS; do
+  printf '%s\n' "$SSID_STATE" | while IFS='|' read -r SSID_ID SSID BAND IFACE CLIENTS; do
     [ -z "$SSID_ID" ] && continue
-    pub -r -t "${BASE}/ssid/${SSID_ID}/state" -m "{\"ssid\":\"$(json_escape "$SSID")\",\"band\":\"${BAND}\",\"ifname\":\"${IFACE}\",\"up\":true,\"clients\":${CLIENTS}}"
-  done
+    pub -r -t "${BASE}/ssid/${SSID_ID}/state" -m "{\"ssid\":\"$(json_escape "$SSID")\",\"band\":\"${BAND}\",\"ifname\":\"${IFACE}\",\"up\":true,\"clients\":${CLIENTS}}" || exit 1
+  done || FAILED=1
+
+  [ "$FAILED" -eq 0 ]
 }
 
 publish_slow_state() {
@@ -299,29 +348,88 @@ do_publish() {
 
   HASH="$(printf '%s\n%s\n' "$STATE" "$SSID_STATE" | sha256sum | awk '{print $1}')"
   OLD_HASH="$(cat "$STATE_HASH_FILE" 2>/dev/null)"
+  FAILED=0
 
   if [ "$HASH" != "$OLD_HASH" ]; then
-    publish_state
-    echo "$HASH" > "$STATE_HASH_FILE"
+    if publish_state; then
+      echo "$HASH" > "$STATE_HASH_FILE"
+    else
+      FAILED=1
+      logger -t openwrt_mqtt 'MQTT fast-state publish failed; will retry'
+    fi
   fi
 
   if [ "$LAST_HEARTBEAT" = "0" ] || [ $((NOW - LAST_HEARTBEAT)) -ge "$HEARTBEAT_SECONDS" ]; then
     build_slow_state
-    publish_slow_state
-    pub -r -t "${BASE}/availability" -m "online"
-    echo "$NOW" > "$HEARTBEAT_FILE"
+    if publish_slow_state; then
+      echo "$NOW" > "$HEARTBEAT_FILE"
+    else
+      FAILED=1
+      logger -t openwrt_mqtt 'MQTT slow-state publish failed; will retry'
+    fi
   fi
+
+  [ "$FAILED" -eq 0 ]
+}
+
+# A single long-lived mosquitto_pub connection sends retained 'online' to the
+# existing device-wide availability topic on every fast poll. That same MQTT
+# connection registers retained 'offline' as its Last Will, so HA marks EVERY
+# existing sensor unavailable when the broker detects an ungraceful loss.
+#
+# No additional HA sensor, automation, or MQTT broker configuration is needed.
+# Other sensor states continue to be sent via short-lived mosquitto_pub calls.
+# The producer and persistent connection share a foreground pipeline, so the
+# monitoring loop cannot run independently of the availability connection.
+do_daemon_session() {
+  # Force full telemetry + discovery on each new connection or after broker
+  # recovery; cached hashes from a previous MQTT session must not suppress it.
+  rm -f "$STATE_HASH_FILE" "$HEARTBEAT_FILE"
+
+  (
+    if do_discovery && do_publish; then
+      printf 'online\n' || exit 1
+    else
+      logger -t openwrt_mqtt 'Initial MQTT telemetry failed; reconnecting'
+      printf 'offline\n' || true
+      exit 1
+    fi
+
+    while :; do
+      sleep "$POLL_SECONDS"
+      if do_publish; then
+        printf 'online\n' || exit 1
+      else
+        logger -t openwrt_mqtt 'MQTT telemetry failed; marking unavailable and reconnecting'
+        printf 'offline\n' || true
+        exit 1
+      fi
+    done
+  ) | mosquitto_pub \
+      -h "$MQTT_HOST" -u "$MQTT_USER" -P "$MQTT_PASS" \
+      -l -r -q 1 -k 60 \
+      -t "${BASE}/availability" \
+      --will-topic "${BASE}/availability" \
+      --will-payload 'offline' --will-retain --will-qos 1
+}
+
+do_offline() {
+  load_config
+  # Explicit offline on clean service stop; MQTT Wills apply only when the
+  # connection drops unexpectedly and therefore aren't sufficient alone.
+  pub -r -q 1 -t "${BASE}/availability" -m 'offline'
 }
 
 do_daemon() {
   load_config
-  logger -t openwrt_mqtt "Starting daemon for ${HOSTNAME}"
+  check_requirements
+  logger -t openwrt_mqtt "Starting persistent MQTT/LWT daemon for ${HOSTNAME}"
 
-  do_publish
-
-  while true; do
-    sleep "$POLL_SECONDS"
-    do_publish
+  while :; do
+    # Retry through startup ordering problems, broker outages, or Wi-Fi loss.
+    do_daemon_session
+    logger -t openwrt_mqtt 'MQTT session ended; retrying in 5 seconds'
+    sleep 5
   done
 }
 
@@ -338,7 +446,7 @@ do_install() {
 
   chmod +x "$SCRIPT"
   create_config
-  create_service
+  create_service || exit 1
 
   do_discovery
   do_publish
@@ -364,8 +472,9 @@ do_status() {
   echo "MQTT host:     $MQTT_HOST"
   echo "MQTT user:     $MQTT_USER"
   echo "Discovery:     $DISC"
-  echo "Heartbeat:     $HEARTBEAT_SECONDS seconds (uptime/load/temp/memory)"
-  echo "Poll interval: $POLL_SECONDS seconds (clients/WiFi up)"
+  echo "Slow state:    $HEARTBEAT_SECONDS seconds (uptime/load/temp/memory)"
+  echo "Fast poll/LWT: $POLL_SECONDS seconds (clients/WiFi and online heartbeat)"
+  echo "MQTT keepalive: 60 seconds (LWT offline at broker)"
   echo
   echo "Detected SSIDs:"
   echo "$SSID_STATE"
@@ -397,11 +506,18 @@ case "$1" in
   status)
     do_status
     ;;
+  offline)
+    do_offline
+    ;;
+  install-service)
+    # Noninteractive upgrade, preserving /etc/config/openwrt_mqtt unchanged.
+    create_service || exit 1
+    ;;
   version)
     echo "OpenWrt MQTT Publisher v${VERSION}"
     ;;
   *)
-    echo "Usage: $0 install|discovery|publish|daemon|all|status|version"
+    echo "Usage: $0 install|install-service|discovery|publish|daemon|offline|all|status|version"
     exit 1
     ;;
 esac
