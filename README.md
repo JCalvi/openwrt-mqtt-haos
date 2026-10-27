@@ -1,6 +1,6 @@
 # openwrt-mqtt-haos
 
-**Version 1.2.3** — publishes OpenWrt router Wi-Fi and system statistics to Home Assistant using MQTT discovery, with device-wide availability monitoring and automatic reconnection.
+**Version 1.2.4** — publishes OpenWrt router Wi-Fi and system statistics to Home Assistant using MQTT discovery, with device-wide availability monitoring and automatic reconnection.
 
 Tested on GL-MT6000 running Alpine-based OpenWrt.
 
@@ -71,9 +71,10 @@ The installer will:
 3. Write config to `/etc/config/openwrt_mqtt` via UCI
 4. Install and enable a procd init service at `/etc/init.d/openwrt_mqtt`
 5. Ensure required files are listed once in `/etc/sysupgrade.conf` (without changing other entries)
-6. Publish MQTT discovery payloads so Home Assistant registers all sensors
-7. Publish initial state immediately (no waiting for the first poll cycle)
-8. Start the daemon
+6. Ensure `/etc/rc.local` contains exactly one `/etc/init.d/openwrt_mqtt start` command **before** `exit 0`
+7. Publish MQTT discovery payloads so Home Assistant registers all sensors
+8. Publish initial state immediately (no waiting for the first poll cycle)
+9. Start the daemon
 
 ---
 
@@ -89,7 +90,7 @@ cp /root/openwrt_mqtt.sh /root/openwrt_mqtt.sh.bak
 wget -O /root/openwrt_mqtt.sh https://raw.githubusercontent.com/JCalvi/openwrt-mqtt-haos/main/openwrt_mqtt.sh
 chmod 755 /root/openwrt_mqtt.sh
 
-# Update the service and sysupgrade preservation entries without config prompts.
+# Update the service, sysupgrade preservation and rc.local fallback without config prompts.
 /root/openwrt_mqtt.sh install-service
 /etc/init.d/openwrt_mqtt restart
 
@@ -97,9 +98,10 @@ chmod 755 /root/openwrt_mqtt.sh
 /root/openwrt_mqtt.sh version
 /etc/init.d/openwrt_mqtt status
 sysupgrade -l | grep -E 'openwrt_mqtt|rc.local'
+grep -n 'openwrt_mqtt start' /etc/rc.local
 ```
 
-For rollback, restore `/root/openwrt_mqtt.sh.bak` and rerun the previous version's installer to restore its original service script if needed. On v1.2.3, `install-service` does **not** prompt for or change the UCI MQTT settings.
+For rollback, restore `/root/openwrt_mqtt.sh.bak` and rerun the previous version's installer to restore its original service script if needed. On v1.2.4, `install-service` does **not** prompt for or change the UCI MQTT settings.
 
 ---
 
@@ -184,7 +186,7 @@ logread | grep openwrt_mqtt
 | Command | Description |
 |---------|-------------|
 | `install` | Full interactive install: deps, config, service, discovery, publish |
-| `install-service` | Noninteractive service update; ensures sysupgrade file preservation and enables the service |
+| `install-service` | Noninteractive service update; enables procd, maintains sysupgrade preservation and rc.local boot fallback |
 | `offline` | Publish retained `offline` (used by the service on clean stop) |
 | `discovery` | Re-publish MQTT discovery payloads (run after adding a new SSID) |
 | `publish` | Publish current state once and exit |
@@ -234,7 +236,15 @@ This shows the current config, all detected SSIDs, and the last fast/slow state 
 /etc/rc.local
 ```
 
-Existing `sysupgrade.conf` entries and comments are preserved. The init service is also enabled. An optional `/etc/rc.local` fallback can remain; it is not required for normal procd operation.
+Existing `sysupgrade.conf` entries and comments are preserved. The init service is also enabled. **Since v1.2.4 the installer automatically maintains an additional `/etc/rc.local` fallback**, placing this line before the standard `exit 0`:
+
+```sh
+/etc/init.d/openwrt_mqtt start
+```
+
+The installer consolidates duplicate standalone start lines and otherwise preserves existing `rc.local` commands. It creates `rc.local` if missing and ensures it is executable. Running `install` or `install-service` repeatedly does not append duplicate lines.
+
+The normal **procd** service remains the primary way MQTT starts and is supervised. `rc.local` provides a secondary start attempt if a firmware upgrade drops the service-enable flag. **Use `start`, not `restart`**, so the fallback does not deliberately restart an already running service. This does not guarantee recovery if the script or its dependencies are absent after an upgrade.
 
 **Important:** `sysupgrade.conf` preserves **files, not installed packages**. During Attended Sysupgrade, ensure required packages such as `mosquitto-client-nossl` are included in the firmware build. If you also use SFTP/FileBrowser, preserve `openssh-sftp-server` in your firmware package selection. Verify functionality after reboot.
 
