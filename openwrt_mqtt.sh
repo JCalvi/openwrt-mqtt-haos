@@ -1,7 +1,7 @@
 #!/bin/sh
 #
 # OpenWrt WiFi MQTT Publisher for Home Assistant
-# Version: 1.2.3
+# Version: 1.2.4
 #
 # Commands:
 #   /root/openwrt_mqtt.sh install
@@ -23,7 +23,7 @@
 #   /etc/init.d/openwrt_mqtt
 #
 
-VERSION="1.2.3"
+VERSION="1.2.4"
 CONFIG="openwrt_mqtt"
 SCRIPT="/root/openwrt_mqtt.sh"
 SERVICE="/etc/init.d/openwrt_mqtt"
@@ -208,6 +208,55 @@ ensure_sysupgrade_config() {
   echo "Verified sysupgrade preservation entries: $KEEP_FILE"
 }
 
+# rc.local is a boot-time fallback if an upgrade has dropped the service's
+# enabled flag. Leave unrelated rc.local commands untouched. Existing starts
+# are moved before the first normal 'exit 0' and consolidated to one line.
+ensure_rc_local_start() {
+  RCLOCAL="/etc/rc.local"
+  RCLOCAL_START="/etc/init.d/openwrt_mqtt start"
+
+  if [ ! -e "$RCLOCAL" ]; then
+    printf '#!/bin/sh\n\nexit 0\n' > "$RCLOCAL" || return 1
+  fi
+  if [ ! -f "$RCLOCAL" ]; then
+    echo "Cannot update $RCLOCAL: not a regular file" >&2
+    return 1
+  fi
+
+  RCLOCAL_TMP="$(mktemp /etc/rc.local.mqtt.XXXXXX)" || return 1
+  if ! awk '
+    # Remove a standalone start command wherever it appeared, including
+    # any copy stranded after exit 0.
+    /^[[:space:]]*\/etc\/init[.]d\/openwrt_mqtt[[:space:]]+start([[:space:]]*(#.*)?)?$/ { next }
+    # Insert the canonical command before the first normal exit 0.
+    /^[[:space:]]*exit[[:space:]]+0([[:space:]]*(#.*)?)?$/ && !inserted {
+      print "/etc/init.d/openwrt_mqtt start"
+      inserted = 1
+    }
+    { print }
+    END {
+      if (!inserted) print "/etc/init.d/openwrt_mqtt start"
+    }
+  ' "$RCLOCAL" > "$RCLOCAL_TMP"; then
+    rm -f "$RCLOCAL_TMP"
+    echo "Failed to prepare $RCLOCAL" >&2
+    return 1
+  fi
+
+  if ! cmp -s "$RCLOCAL_TMP" "$RCLOCAL"; then
+    # Write to the existing file so its ownership, mode and any symlink
+    # target are not replaced. Keep the original if generation fails.
+    if ! cat "$RCLOCAL_TMP" > "$RCLOCAL"; then
+      rm -f "$RCLOCAL_TMP"
+      echo "Failed to update $RCLOCAL" >&2
+      return 1
+    fi
+  fi
+  rm -f "$RCLOCAL_TMP"
+  chmod +x "$RCLOCAL" || return 1
+  echo "Verified boot fallback in $RCLOCAL: $RCLOCAL_START"
+}
+
 create_service() {
   cat > "$SERVICE" <<'SVC'
 #!/bin/sh /etc/rc.common
@@ -233,9 +282,13 @@ stop_service() {
 }
 SVC
 
-  chmod +x "$SERVICE"
-  "$SERVICE" enable >/dev/null 2>&1
+  chmod +x "$SERVICE" || return 1
+  if ! "$SERVICE" enable >/dev/null 2>&1; then
+    echo "Failed to enable service: $SERVICE" >&2
+    return 1
+  fi
   ensure_sysupgrade_config || return 1
+  ensure_rc_local_start || return 1
   echo "Installed service: $SERVICE"
 }
 
