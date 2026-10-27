@@ -1,6 +1,6 @@
 # openwrt-mqtt-haos
 
-Publishes OpenWrt router stats to Home Assistant via MQTT discovery.
+**Version 1.2.3** — publishes OpenWrt router Wi-Fi and system statistics to Home Assistant using MQTT discovery, with device-wide availability monitoring and automatic reconnection.
 
 Tested on GL-MT6000 running Alpine-based OpenWrt.
 
@@ -16,7 +16,9 @@ It uses two publish speeds:
 - **Fast (default 60s)** — client counts and WiFi up/down status, published whenever something changes
 - **Slow (default 300s)** — CPU temperature, memory usage, load average and uptime, published on a heartbeat timer
 
-Change detection is used for fast state — if nothing changes, nothing is published.
+Fast telemetry uses change detection; if nothing changes, the state payload is not republished. The daemon separately publishes a retained `online` heartbeat on each fast poll using a **persistent MQTT connection**, with a retained `offline` MQTT Last Will (LWT). This shared availability topic covers **all** the sensors on the device, without Home Assistant automations. The broker detects an unexpected connection loss using MQTT keepalive (60 seconds). On a clean service stop, the service explicitly publishes `offline`.
+
+If the MQTT broker is temporarily unavailable, the daemon retries. After reconnection it republishes discovery and current readings. Unsuccessful data publications are retried instead of being marked complete.
 
 ---
 
@@ -44,7 +46,7 @@ SSIDs are auto-detected from `iw dev` at discovery time. Each SSID gets its own 
 
 ## Requirements
 
-- OpenWrt (Alpine/apk-based, 23.05+)
+- OpenWrt with `apk` packaging (tested on OpenWrt 25.x / GL-MT6000)
 - `mosquitto-client-nossl` — installed automatically by the script
 - `iw` — included in OpenWrt by default
 - `uci` — included in OpenWrt by default
@@ -68,9 +70,36 @@ The installer will:
 2. Prompt for MQTT configuration, showing defaults in brackets — press Enter to accept
 3. Write config to `/etc/config/openwrt_mqtt` via UCI
 4. Install and enable a procd init service at `/etc/init.d/openwrt_mqtt`
-5. Publish MQTT discovery payloads so Home Assistant registers all sensors
-6. Publish initial state immediately (no waiting for the first poll cycle)
-7. Start the daemon
+5. Ensure required files are listed once in `/etc/sysupgrade.conf` (without changing other entries)
+6. Publish MQTT discovery payloads so Home Assistant registers all sensors
+7. Publish initial state immediately (no waiting for the first poll cycle)
+8. Start the daemon
+
+---
+
+## Upgrade from an earlier version
+
+The following **noninteractive upgrade** preserves your current MQTT credentials, UCI configuration, MQTT topics, and Home Assistant entity IDs:
+
+```sh
+# Back up the existing script.
+cp /root/openwrt_mqtt.sh /root/openwrt_mqtt.sh.bak
+
+# Fetch the latest version.
+wget -O /root/openwrt_mqtt.sh https://raw.githubusercontent.com/JCalvi/openwrt-mqtt-haos/main/openwrt_mqtt.sh
+chmod 755 /root/openwrt_mqtt.sh
+
+# Update the service and sysupgrade preservation entries without config prompts.
+/root/openwrt_mqtt.sh install-service
+/etc/init.d/openwrt_mqtt restart
+
+# Verify.
+/root/openwrt_mqtt.sh version
+/etc/init.d/openwrt_mqtt status
+sysupgrade -l | grep -E 'openwrt_mqtt|rc.local'
+```
+
+For rollback, restore `/root/openwrt_mqtt.sh.bak` and rerun the previous version's installer to restore its original service script if needed. On v1.2.3, `install-service` does **not** prompt for or change the UCI MQTT settings.
 
 ---
 
@@ -104,7 +133,7 @@ uci set openwrt_mqtt.@mqtt[0].host='192.168.1.5'
 uci commit openwrt_mqtt
 ```
 
-Config changes are picked up automatically on the next poll cycle — no restart needed.
+Telemetry options are re-read each poll. After changing connection-related values (broker host, credentials, or discovery prefix), **restart the service** to replace the persistent MQTT/LWT connection.
 
 To re-run the interactive config prompts at any time:
 
@@ -131,7 +160,16 @@ The script installs itself as a procd init service that starts automatically on 
 /etc/init.d/openwrt_mqtt disable
 ```
 
-The service runs `/root/openwrt_mqtt.sh daemon` which loops indefinitely, sleeping for `poll_interval` seconds between publishes.
+The service runs `/root/openwrt_mqtt.sh daemon` which loops indefinitely, maintaining the availability connection and sleeping for `poll_interval` seconds between polls. It restarts on unexpected failure, and advertises `offline` on clean shutdown.
+
+```sh
+# Verify configuration, service, and version.
+/root/openwrt_mqtt.sh version
+/root/openwrt_mqtt.sh status
+/etc/init.d/openwrt_mqtt status
+```
+
+**Availability test:** run `/etc/init.d/openwrt_mqtt stop`. All sensors using `openwrt/{device_id}/availability` should become unavailable in Home Assistant. Run `/etc/init.d/openwrt_mqtt start` to recover.
 
 Logs are available via:
 
@@ -145,7 +183,9 @@ logread | grep openwrt_mqtt
 
 | Command | Description |
 |---------|-------------|
-| `install` | Full install: deps, config, service, discovery, publish |
+| `install` | Full interactive install: deps, config, service, discovery, publish |
+| `install-service` | Noninteractive service update; ensures sysupgrade file preservation and enables the service |
+| `offline` | Publish retained `offline` (used by the service on clean stop) |
 | `discovery` | Re-publish MQTT discovery payloads (run after adding a new SSID) |
 | `publish` | Publish current state once and exit |
 | `daemon` | Run as a continuous polling daemon (used by the service) |
@@ -174,12 +214,29 @@ This shows the current config, all detected SSIDs, and the last fast/slow state 
 
 | Topic | Contents |
 |-------|----------|
-| `openwrt/{device_id}/availability` | `online` / `offline` |
+| `openwrt/{device_id}/availability` | Retained `online` / `offline`, shared by all device sensors, with persistent MQTT LWT |
 | `openwrt/{device_id}/state` | `{"healthy": true, "clients_total": 24}` |
 | `openwrt/{device_id}/slow_state` | `{"uptime": 12345, "load1": "0.09", "memory_used_pct": 14, "cpu_temp": 43}` |
 | `openwrt/{device_id}/ssid/{ssid_id}/state` | `{"ssid": "MyWiFi", "band": "24", "ifname": "phy0-ap0", "up": true, "clients": 18}` |
 
 `{device_id}` is the router hostname converted to lowercase with special characters replaced by hyphens (e.g. `GL-MT6000-Upstairs` → `gl-mt6000-upstairs`).
+
+---
+
+## Firmware upgrades and persistence
+
+`install` and `install-service` automatically ensure these entries exist **once** in `/etc/sysupgrade.conf`:
+
+```text
+/root/openwrt_mqtt.sh
+/etc/config/openwrt_mqtt
+/etc/init.d/openwrt_mqtt
+/etc/rc.local
+```
+
+Existing `sysupgrade.conf` entries and comments are preserved. The init service is also enabled. An optional `/etc/rc.local` fallback can remain; it is not required for normal procd operation.
+
+**Important:** `sysupgrade.conf` preserves **files, not installed packages**. During Attended Sysupgrade, ensure required packages such as `mosquitto-client-nossl` are included in the firmware build. If you also use SFTP/FileBrowser, preserve `openssh-sftp-server` in your firmware package selection. Verify functionality after reboot.
 
 ---
 
