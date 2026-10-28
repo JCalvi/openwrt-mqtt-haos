@@ -1,6 +1,6 @@
 # openwrt-mqtt-haos
 
-**Version 1.2.5** — publishes OpenWrt router Wi-Fi and system statistics to Home Assistant using MQTT discovery, with device-wide availability monitoring and automatic reconnection.
+**Version 1.2.6** — publishes OpenWrt router Wi-Fi and system statistics to Home Assistant using MQTT discovery, with device-wide availability monitoring and automatic reconnection.
 
 Tested on GL-MT6000 running Alpine-based OpenWrt.
 
@@ -19,6 +19,23 @@ It uses two publish speeds:
 Fast telemetry uses **independent change detection for the main state and each SSID**. If one SSID's client count changes, only that SSID's MQTT topic is published; unchanged topics stay silent. This reduces the number of short-lived MQTT connections and Mosquitto connection logs without changing the Home Assistant entities, MQTT topics or sampling intervals. The daemon separately publishes a retained `online` heartbeat on each fast poll using a **persistent MQTT connection**, with a retained `offline` MQTT Last Will (LWT). This shared availability topic covers **all** the sensors on the device, without Home Assistant automations. The broker detects an unexpected connection loss using MQTT keepalive (60 seconds). On a clean service stop, the service explicitly publishes `offline`.
 
 If the MQTT broker is temporarily unavailable, the daemon retries. After reconnection it republishes discovery and current readings. Unsuccessful data publications are retried instead of being marked complete.
+
+### v1.2.6: automatic orphan cleanup and reliable shutdown
+
+When older versions stopped, OpenWrt's `procd` could terminate the main daemon while leaving its shell-pipeline children (or their persistent MQTT availability publisher) running. This could produce extra MQTT connections and competing retained availability messages.
+
+v1.2.6 replaces the foreground shell pipeline with a tracked, FIFO-connected producer and persistent publisher. A TERM/INT/HUP handler stops both child processes and removes the FIFO. The init service also runs `cleanup-orphans` automatically **after stopping the old procd instance** and **before a fresh start**, so upgrading and restarting removes leftover processes from v1.2.4/v1.2.5 without manually finding or killing PIDs.
+
+The cleanup checks the exact OpenWrt script daemon command and the matching retained availability topic before signalling a process. It does not print MQTT command-line arguments or passwords. MQTT configuration, topics, entity IDs, and publishing intervals are unchanged.
+
+For **each router**, install the new script using the noninteractive upgrade instructions below; `install-service` updates the service hooks, and the subsequent `restart` triggers automatic cleanup. Do not run the cleanup command manually during normal operation.
+
+Tests:
+
+```sh
+sh tests/test_telemetry_publish.sh
+sh tests/test_service_lifecycle.sh
+```
 
 ### v1.2.5: fewer MQTT connections
 
@@ -115,7 +132,7 @@ sysupgrade -l | grep -E 'openwrt_mqtt|rc.local'
 grep -n 'openwrt_mqtt start' /etc/rc.local
 ```
 
-For rollback, restore `/root/openwrt_mqtt.sh.bak` and rerun the previous version's installer to restore its original service script if needed. On v1.2.5, `install-service` does **not** prompt for or change the UCI MQTT settings.
+For rollback, restore `/root/openwrt_mqtt.sh.bak` and rerun the previous version's installer to restore its original service script if needed. On v1.2.6, `install-service` does **not** prompt for or change the UCI MQTT settings.
 
 ---
 
@@ -176,7 +193,7 @@ The script installs itself as a procd init service that starts automatically on 
 /etc/init.d/openwrt_mqtt disable
 ```
 
-The service runs `/root/openwrt_mqtt.sh daemon` which loops indefinitely, maintaining the availability connection and sleeping for `poll_interval` seconds between polls. It restarts on unexpected failure, and advertises `offline` on clean shutdown.
+The service runs `/root/openwrt_mqtt.sh daemon` which loops indefinitely, maintaining the availability connection and sleeping for `poll_interval` seconds between polls. It restarts on unexpected failure, automatically terminates its child processes on shutdown, removes legacy orphans during service restart, and advertises `offline` on clean shutdown.
 
 ```sh
 # Verify configuration, service, and version.
