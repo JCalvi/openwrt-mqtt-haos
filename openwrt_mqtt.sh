@@ -1,7 +1,7 @@
 #!/bin/sh
 #
 # OpenWrt WiFi MQTT Publisher for Home Assistant
-# Version: 1.2.4
+# Version: 1.2.5
 #
 # Commands:
 #   /root/openwrt_mqtt.sh install
@@ -23,12 +23,13 @@
 #   /etc/init.d/openwrt_mqtt
 #
 
-VERSION="1.2.4"
+VERSION="1.2.5"
 CONFIG="openwrt_mqtt"
 SCRIPT="/root/openwrt_mqtt.sh"
 SERVICE="/etc/init.d/openwrt_mqtt"
 
 STATE_HASH_FILE="/tmp/openwrt_mqtt_state.hash"
+SSID_HASH_DIR="/tmp/openwrt_mqtt_ssid_hashes"
 SLOW_HASH_FILE="/tmp/openwrt_mqtt_slow.hash"
 HEARTBEAT_FILE="/tmp/openwrt_mqtt_heartbeat"
 
@@ -374,14 +375,36 @@ build_slow_state() {
   SLOW_STATE="{\"uptime\":${UPTIME},\"load1\":\"${LOAD1}\",\"memory_used_pct\":${MEM_USED_PCT},\"cpu_temp\":${CPU_TEMP}}"
 }
 
+# Maintain independent hashes for each MQTT state topic. A changed client
+# count on one SSID should not republish every other SSID and the main state.
+# Hashes are written only after successful publication so failures are retried.
 publish_state() {
   FAILED=0
-  pub -r -t "${BASE}/state" -m "$STATE" || FAILED=1
 
-  printf '%s\n' "$SSID_STATE" | while IFS='|' read -r SSID_ID SSID BAND IFACE CLIENTS; do
+  MAIN_HASH="$(printf '%s' "$STATE" | sha256sum | awk '{print $1}')"
+  if [ "$MAIN_HASH" != "$(cat "$STATE_HASH_FILE" 2>/dev/null)" ]; then
+    if pub -r -t "${BASE}/state" -m "$STATE"; then
+      printf '%s\n' "$MAIN_HASH" > "$STATE_HASH_FILE" || FAILED=1
+    else
+      FAILED=1
+    fi
+  fi
+
+  mkdir -p "$SSID_HASH_DIR" || return 1
+  if ! printf '%s\n' "$SSID_STATE" | while IFS='|' read -r SSID_ID SSID BAND IFACE CLIENTS; do
     [ -z "$SSID_ID" ] && continue
-    pub -r -t "${BASE}/ssid/${SSID_ID}/state" -m "{\"ssid\":\"$(json_escape "$SSID")\",\"band\":\"${BAND}\",\"ifname\":\"${IFACE}\",\"up\":true,\"clients\":${CLIENTS}}" || exit 1
-  done || FAILED=1
+
+    SSID_PAYLOAD="{\"ssid\":\"$(json_escape "$SSID")\",\"band\":\"${BAND}\",\"ifname\":\"${IFACE}\",\"up\":true,\"clients\":${CLIENTS}}"
+    SSID_HASH="$(printf '%s' "$SSID_PAYLOAD" | sha256sum | awk '{print $1}')"
+    SSID_HASH_FILE="${SSID_HASH_DIR}/${SSID_ID}.hash"
+
+    if [ "$SSID_HASH" != "$(cat "$SSID_HASH_FILE" 2>/dev/null)" ]; then
+      pub -r -t "${BASE}/ssid/${SSID_ID}/state" -m "$SSID_PAYLOAD" || exit 1
+      printf '%s\n' "$SSID_HASH" > "$SSID_HASH_FILE" || exit 1
+    fi
+  done; then
+    FAILED=1
+  fi
 
   [ "$FAILED" -eq 0 ]
 }
@@ -399,17 +422,11 @@ do_publish() {
   LAST_HEARTBEAT="$(cat "$HEARTBEAT_FILE" 2>/dev/null)"
   [ -z "$LAST_HEARTBEAT" ] && LAST_HEARTBEAT=0
 
-  HASH="$(printf '%s\n%s\n' "$STATE" "$SSID_STATE" | sha256sum | awk '{print $1}')"
-  OLD_HASH="$(cat "$STATE_HASH_FILE" 2>/dev/null)"
   FAILED=0
 
-  if [ "$HASH" != "$OLD_HASH" ]; then
-    if publish_state; then
-      echo "$HASH" > "$STATE_HASH_FILE"
-    else
-      FAILED=1
-      logger -t openwrt_mqtt 'MQTT fast-state publish failed; will retry'
-    fi
+  if ! publish_state; then
+    FAILED=1
+    logger -t openwrt_mqtt 'MQTT fast-state publish failed; will retry'
   fi
 
   if [ "$LAST_HEARTBEAT" = "0" ] || [ $((NOW - LAST_HEARTBEAT)) -ge "$HEARTBEAT_SECONDS" ]; then
@@ -431,13 +448,15 @@ do_publish() {
 # existing sensor unavailable when the broker detects an ungraceful loss.
 #
 # No additional HA sensor, automation, or MQTT broker configuration is needed.
-# Other sensor states continue to be sent via short-lived mosquitto_pub calls.
+# Changed sensor states continue to use short-lived mosquitto_pub calls,
+# but unchanged per-SSID and main-state topics are not republished.
 # The producer and persistent connection share a foreground pipeline, so the
 # monitoring loop cannot run independently of the availability connection.
 do_daemon_session() {
   # Force full telemetry + discovery on each new connection or after broker
   # recovery; cached hashes from a previous MQTT session must not suppress it.
   rm -f "$STATE_HASH_FILE" "$HEARTBEAT_FILE"
+  rm -rf "$SSID_HASH_DIR"
 
   (
     if do_discovery && do_publish; then
