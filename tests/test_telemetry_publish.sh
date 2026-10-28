@@ -9,7 +9,7 @@ WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT HUP INT TERM
 
 # Source only function definitions; never run the script's CLI entry point.
-awk '/^case "\\$1" in$/ { exit } { print }' "$SCRIPT" > "$WORK/functions.sh"
+awk '/^case "\$1" in$/ { exit } { print }' "$SCRIPT" > "$WORK/functions.sh"
 . "$WORK/functions.sh"
 
 STATE_HASH_FILE="$WORK/state.hash"
