@@ -1,7 +1,7 @@
 #!/bin/sh
 #
 # OpenWrt WiFi MQTT Publisher for Home Assistant
-# Version: 1.2.5
+# Version: 1.2.6
 #
 # Commands:
 #   /root/openwrt_mqtt.sh install
@@ -23,7 +23,7 @@
 #   /etc/init.d/openwrt_mqtt
 #
 
-VERSION="1.2.5"
+VERSION="1.2.6"
 CONFIG="openwrt_mqtt"
 SCRIPT="/root/openwrt_mqtt.sh"
 SERVICE="/etc/init.d/openwrt_mqtt"
@@ -100,6 +100,80 @@ check_requirements() {
 
 pub() {
   mosquitto_pub -h "$MQTT_HOST" -u "$MQTT_USER" -P "$MQTT_PASS" "$@"
+}
+
+
+# Match only this add-on's long-running script processes, not unrelated shells.
+# Inspect /proc arguments without printing them (MQTT passwords may appear in
+# mosquitto_pub command lines).
+is_our_daemon_pid() {
+  [ -r "/proc/$1/cmdline" ] || return 1
+  CMD_ARGS="$(tr '\000' '\n' < "/proc/$1/cmdline")"
+  CMD1="$(printf '%s\n' "$CMD_ARGS" | sed -n '1p')"
+  CMD2="$(printf '%s\n' "$CMD_ARGS" | sed -n '2p')"
+  CMD3="$(printf '%s\n' "$CMD_ARGS" | sed -n '3p')"
+  if [ "$CMD1" = "$SCRIPT" ] && [ "$CMD2" = "daemon" ]; then
+    return 0
+  fi
+  case "$CMD1" in
+    sh|ash|*/sh|*/ash)
+      [ "$CMD2" = "$SCRIPT" ] && [ "$CMD3" = "daemon" ]
+      return $?
+      ;;
+  esac
+  return 1
+}
+
+# Also find any old persistent availability mosquitto_pub clients orphaned by
+# a previous shell pipeline. Do not touch other MQTT publishers.
+is_our_availability_pid() {
+  [ -r "/proc/$1/cmdline" ] || return 1
+  CMD_ARGS="$(tr '\000' '\n' < "/proc/$1/cmdline")"
+  CMD1="$(printf '%s\n' "$CMD_ARGS" | sed -n '1p')"
+  case "$CMD1" in
+    mosquitto_pub|*/mosquitto_pub) ;;
+    *) return 1 ;;
+  esac
+  printf '%s\n' "$CMD_ARGS" | awk -v topic="${BASE}/availability" '
+    $0 == "-l" { line_mode = 1 }
+    prev == "-t" && $0 == topic { target = 1 }
+    prev == "--will-topic" && $0 == topic { will = 1 }
+    { prev = $0 }
+    END { exit !(line_mode && target && will) }
+  '
+}
+
+is_our_legacy_pid() {
+  is_our_daemon_pid "$1" || is_our_availability_pid "$1"
+}
+
+# This runs before a new procd instance starts and after the old instance
+# stops. Sweep only matching daemon/availability processes. A TERM grace
+# period is followed by a verified KILL for processes that ignored TERM.
+# In particular, this removes orphans left by v1.2.4/v1.2.5.
+cleanup_orphans() {
+  load_config
+  TARGETS=""
+  for PROC in /proc/[0-9]*; do
+    [ -d "$PROC" ] || continue
+    PID="${PROC##*/}"
+    [ "$PID" = "$" ] && continue
+    if is_our_legacy_pid "$PID"; then
+      TARGETS="$TARGETS $PID"
+    fi
+  done
+  [ -n "$TARGETS" ] || return 0
+
+  for PID in $TARGETS; do
+    kill -TERM "$PID" 2>/dev/null || true
+  done
+  sleep 2
+  for PID in $TARGETS; do
+    if is_our_legacy_pid "$PID"; then
+      kill -KILL "$PID" 2>/dev/null || true
+    fi
+  done
+  logger -t openwrt_mqtt "Cleaned up leftover MQTT daemon/availability processes"
 }
 
 publish_sensor() {
@@ -267,19 +341,27 @@ STOP=10
 USE_PROCD=1
 
 start_service() {
+        # OpenWrt procd manages the main PID but older pipeline children
+        # can survive. On a fresh start, remove legacy orphans before
+        # opening the replacement MQTT availability connection.
+        if [ -z "$IPKG_INSTROOT" ] && ! procd_running openwrt_mqtt; then
+                /root/openwrt_mqtt.sh cleanup-orphans
+        fi
         procd_open_instance
         procd_set_param command /root/openwrt_mqtt.sh daemon
-        # Retry indefinitely after unexpected failures.
         procd_set_param respawn 3600 5 0
+        procd_set_param term_timeout 10
         procd_set_param stdout 1
         procd_set_param stderr 1
         procd_close_instance
 }
 
-stop_service() {
-        # procd stops may close the persistent publisher cleanly (no MQTT LWT).
-        # Explicitly mark the device offline before stopping it.
-        [ -z "$IPKG_INSTROOT" ] && /root/openwrt_mqtt.sh offline >/dev/null 2>&1 || true
+service_stopped() {
+        # Called after procd stops the main instance. Remove any
+        # remaining pipeline/availability children, then publish offline.
+        [ -n "$IPKG_INSTROOT" ] && return 0
+        /root/openwrt_mqtt.sh cleanup-orphans
+        /root/openwrt_mqtt.sh offline >/dev/null 2>&1 || true
 }
 SVC
 
@@ -442,47 +524,87 @@ do_publish() {
   [ "$FAILED" -eq 0 ]
 }
 
-# A single long-lived mosquitto_pub connection sends retained 'online' to the
-# existing device-wide availability topic on every fast poll. That same MQTT
-# connection registers retained 'offline' as its Last Will, so HA marks EVERY
-# existing sensor unavailable when the broker detects an ungraceful loss.
-#
-# No additional HA sensor, automation, or MQTT broker configuration is needed.
-# Changed sensor states continue to use short-lived mosquitto_pub calls,
-# but unchanged per-SSID and main-state topics are not republished.
-# The producer and persistent connection share a foreground pipeline, so the
-# monitoring loop cannot run independently of the availability connection.
+# Keep a single long-lived availability/LWT publisher and a background
+# producer linked by a FIFO. Both child PIDs are tracked so SIGTERM from
+# procd can terminate and reap them instead of leaving pipeline orphans.
+# Changed telemetry still publishes to the existing retained MQTT topics.
+session_producer() {
+  PRODUCER_SLEEP_PID=""
+  trap 'if [ -n "$PRODUCER_SLEEP_PID" ]; then kill "$PRODUCER_SLEEP_PID" 2>/dev/null || true; fi; exit 0' TERM INT HUP
+
+  if do_discovery && do_publish; then
+    printf 'online\n' || return 1
+  else
+    logger -t openwrt_mqtt 'Initial MQTT telemetry failed; reconnecting'
+    printf 'offline\n' || true
+    return 1
+  fi
+
+  while :; do
+    sleep "$POLL_SECONDS" &
+    PRODUCER_SLEEP_PID=$!
+    wait "$PRODUCER_SLEEP_PID" || return 1
+    PRODUCER_SLEEP_PID=""
+
+    if do_publish; then
+      printf 'online\n' || return 1
+    else
+      logger -t openwrt_mqtt 'MQTT telemetry failed; marking unavailable and reconnecting'
+      printf 'offline\n' || true
+      return 1
+    fi
+  done
+}
+
+stop_session() {
+  for CHILD in "$PRODUCER_PID" "$MQTT_PID" "$RETRY_SLEEP_PID"; do
+    [ -n "$CHILD" ] && kill -TERM "$CHILD" 2>/dev/null || true
+  done
+  for CHILD in "$PRODUCER_PID" "$MQTT_PID" "$RETRY_SLEEP_PID"; do
+    [ -n "$CHILD" ] && wait "$CHILD" 2>/dev/null || true
+  done
+  [ -n "$SESSION_FIFO" ] && rm -f "$SESSION_FIFO"
+  PRODUCER_PID=""
+  MQTT_PID=""
+  RETRY_SLEEP_PID=""
+  SESSION_FIFO=""
+}
+
+terminate_daemon() {
+  trap - TERM INT HUP
+  stop_session
+  exit 0
+}
+
 do_daemon_session() {
-  # Force full telemetry + discovery on each new connection or after broker
-  # recovery; cached hashes from a previous MQTT session must not suppress it.
+  # Force a full republish on each new MQTT connection or broker recovery.
   rm -f "$STATE_HASH_FILE" "$HEARTBEAT_FILE"
   rm -rf "$SSID_HASH_DIR"
 
-  (
-    if do_discovery && do_publish; then
-      printf 'online\n' || exit 1
-    else
-      logger -t openwrt_mqtt 'Initial MQTT telemetry failed; reconnecting'
-      printf 'offline\n' || true
-      exit 1
-    fi
+  SESSION_FIFO="/tmp/openwrt_mqtt_$$.fifo"
+  rm -f "$SESSION_FIFO"
+  umask 077
+  if ! mkfifo "$SESSION_FIFO"; then
+    logger -t openwrt_mqtt 'Failed to create MQTT publisher FIFO'
+    SESSION_FIFO=""
+    return 1
+  fi
 
-    while :; do
-      sleep "$POLL_SECONDS"
-      if do_publish; then
-        printf 'online\n' || exit 1
-      else
-        logger -t openwrt_mqtt 'MQTT telemetry failed; marking unavailable and reconnecting'
-        printf 'offline\n' || true
-        exit 1
-      fi
-    done
-  ) | mosquitto_pub \
+  ( session_producer ) > "$SESSION_FIFO" &
+  PRODUCER_PID=$!
+  mosquitto_pub \
       -h "$MQTT_HOST" -u "$MQTT_USER" -P "$MQTT_PASS" \
       -l -r -q 1 -k 60 \
       -t "${BASE}/availability" \
       --will-topic "${BASE}/availability" \
-      --will-payload 'offline' --will-retain --will-qos 1
+      --will-payload 'offline' --will-retain --will-qos 1 \
+      < "$SESSION_FIFO" &
+  MQTT_PID=$!
+
+  wait "$MQTT_PID"
+  SESSION_RESULT=$?
+  stop_session
+  return "$SESSION_RESULT"
 }
 
 do_offline() {
@@ -495,13 +617,21 @@ do_offline() {
 do_daemon() {
   load_config
   check_requirements
+  PRODUCER_PID=""
+  MQTT_PID=""
+  RETRY_SLEEP_PID=""
+  SESSION_FIFO=""
+  trap 'terminate_daemon' TERM INT HUP
   logger -t openwrt_mqtt "Starting persistent MQTT/LWT daemon for ${HOSTNAME}"
 
   while :; do
     # Retry through startup ordering problems, broker outages, or Wi-Fi loss.
     do_daemon_session
     logger -t openwrt_mqtt 'MQTT session ended; retrying in 5 seconds'
-    sleep 5
+    sleep 5 &
+    RETRY_SLEEP_PID=$!
+    wait "$RETRY_SLEEP_PID" || true
+    RETRY_SLEEP_PID=""
   done
 }
 
@@ -581,6 +711,9 @@ case "$1" in
   offline)
     do_offline
     ;;
+  cleanup-orphans)
+    cleanup_orphans
+    ;;
   install-service)
     # Noninteractive upgrade, preserving /etc/config/openwrt_mqtt unchanged.
     create_service || exit 1
@@ -589,7 +722,7 @@ case "$1" in
     echo "OpenWrt MQTT Publisher v${VERSION}"
     ;;
   *)
-    echo "Usage: $0 install|install-service|discovery|publish|daemon|offline|all|status|version"
+    echo "Usage: $0 install|install-service|discovery|publish|daemon|offline|cleanup-orphans|all|status|version"
     exit 1
     ;;
 esac
