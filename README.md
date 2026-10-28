@@ -1,6 +1,6 @@
 # openwrt-mqtt-haos
 
-**Version 1.2.4** — publishes OpenWrt router Wi-Fi and system statistics to Home Assistant using MQTT discovery, with device-wide availability monitoring and automatic reconnection.
+**Version 1.2.5** — publishes OpenWrt router Wi-Fi and system statistics to Home Assistant using MQTT discovery, with device-wide availability monitoring and automatic reconnection.
 
 Tested on GL-MT6000 running Alpine-based OpenWrt.
 
@@ -16,9 +16,23 @@ It uses two publish speeds:
 - **Fast (default 60s)** — client counts and WiFi up/down status, published whenever something changes
 - **Slow (default 300s)** — CPU temperature, memory usage, load average and uptime, published on a heartbeat timer
 
-Fast telemetry uses change detection; if nothing changes, the state payload is not republished. The daemon separately publishes a retained `online` heartbeat on each fast poll using a **persistent MQTT connection**, with a retained `offline` MQTT Last Will (LWT). This shared availability topic covers **all** the sensors on the device, without Home Assistant automations. The broker detects an unexpected connection loss using MQTT keepalive (60 seconds). On a clean service stop, the service explicitly publishes `offline`.
+Fast telemetry uses **independent change detection for the main state and each SSID**. If one SSID's client count changes, only that SSID's MQTT topic is published; unchanged topics stay silent. This reduces the number of short-lived MQTT connections and Mosquitto connection logs without changing the Home Assistant entities, MQTT topics or sampling intervals. The daemon separately publishes a retained `online` heartbeat on each fast poll using a **persistent MQTT connection**, with a retained `offline` MQTT Last Will (LWT). This shared availability topic covers **all** the sensors on the device, without Home Assistant automations. The broker detects an unexpected connection loss using MQTT keepalive (60 seconds). On a clean service stop, the service explicitly publishes `offline`.
 
 If the MQTT broker is temporarily unavailable, the daemon retries. After reconnection it republishes discovery and current readings. Unsuccessful data publications are retried instead of being marked complete.
+
+### v1.2.5: fewer MQTT connections
+
+Earlier versions cached one combined hash for all fast readings. Whenever any SSID's client count changed, the script republished the main state and **every** SSID, opening a new MQTT connection for each topic.
+
+v1.2.5 maintains a separate hash in `/tmp` for each topic. It only opens a new short-lived MQTT connection for a topic whose payload has actually changed. **All existing topics, discovery unique IDs and retained values remain unchanged.** Cached hashes are cleared when the daemon reconnects, so the current states are republished after an outage. Failed publications are not cached and are retried.
+
+The separate long-lived MQTT availability connection and its retained offline Last Will are unchanged. Discovery still uses individual publish connections when the service starts or reconnects.
+
+To run the no-broker regression test from a checkout:
+
+```sh
+sh tests/test_telemetry_publish.sh
+```
 
 ---
 
@@ -101,7 +115,7 @@ sysupgrade -l | grep -E 'openwrt_mqtt|rc.local'
 grep -n 'openwrt_mqtt start' /etc/rc.local
 ```
 
-For rollback, restore `/root/openwrt_mqtt.sh.bak` and rerun the previous version's installer to restore its original service script if needed. On v1.2.4, `install-service` does **not** prompt for or change the UCI MQTT settings.
+For rollback, restore `/root/openwrt_mqtt.sh.bak` and rerun the previous version's installer to restore its original service script if needed. On v1.2.5, `install-service` does **not** prompt for or change the UCI MQTT settings.
 
 ---
 
