@@ -38,11 +38,19 @@ publish_mwan
             r=subprocess.run(['sh'],input=source+'\nOUT='+d+'\n'+harness,text=True,capture_output=True)
             self.assertEqual(r.returncode,0,r.stderr)
             payloads=[json.loads(x) for x in pathlib.Path(d+'/discovery').read_text().splitlines()]
-            self.assertEqual(len(payloads),14) # 8 interface, 4 percentages, 2 active
-            self.assertEqual(len({p['unique_id'] for p in payloads}),14)
+            self.assertEqual(len(payloads),18) # 12 interface, 4 percentages, 2 active
+            self.assertEqual(len({p['unique_id'] for p in payloads}),18)
             for p in payloads:
                 self.assertEqual(p['availability_mode'],'all')
                 self.assertEqual(len(p['availability']),2)
+            connected=[p for p in payloads if p.get('device_class') == 'connectivity']
+            self.assertEqual(len(connected),4)
+            self.assertEqual({p['unique_id'] for p in connected},
+                             {f'test_mwan_{i}_connected' for i in ('wan','mobile','wan6','mobile6')})
+            for p in connected:
+                self.assertEqual(p['payload_on'],'true')
+                self.assertEqual(p['payload_off'],'false')
+                self.assertIn("== 'online'",p['value_template'])
             published=pathlib.Path(d+'/published').read_text()
             self.assertIn('mwan3/state',published)
             self.assertIn('mwan3/availability -m online',published)
