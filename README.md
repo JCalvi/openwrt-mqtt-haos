@@ -1,6 +1,6 @@
 # openwrt-mqtt-haos
 
-**Version 1.2.7** — publishes OpenWrt router Wi-Fi and system statistics to Home Assistant using MQTT discovery, with device-wide availability monitoring and automatic reconnection.
+**Version 1.2.8** — publishes OpenWrt router Wi-Fi and system statistics to Home Assistant using MQTT discovery, with device-wide availability monitoring and automatic reconnection.
 
 Tested on GL-MT6000 running Alpine-based OpenWrt.
 
@@ -14,7 +14,7 @@ With native nftables mwan3 configured, discovery adds interface status and onlin
 - `failover`: wan/mobile percentages and active IPv4 connection.
 - `failover6`: wan6/mobile6 percentages and active IPv6 connection.
 
-Online duration is published as seconds with HA's duration device class. Percentages are mwan3 policy allocations, **not measured bandwidth usage**. Zero percent means standby. Multiple active members are listed when load balancing. Data comes from `ubus -t 5 call mwan3 status`, the structured RPC used by LuCI, not the CLI summary that can omit IPv6 policies. This requires native mwan3's RPC and `ubus`/`jsonfilter`.
+Online duration uses the same readable text format as router Uptime: `2m 34s`, `2h 32m`, or `4d 22h`. v1.2.8 removes the previous seconds unit and duration device class; rerun discovery (or restart the publisher) to refresh existing entities. Percentages are mwan3 policy allocations, **not measured bandwidth usage**. Zero percent means standby. Multiple active members are listed when load balancing. Data comes from `ubus -t 5 call mwan3 status`, the structured RPC used by LuCI, not the CLI summary that can omit IPv6 policies. This requires native mwan3's RPC and `ubus`/`jsonfilter`.
 
 The retained JSON topic is `openwrt/{id}/mwan3/state`. Sensors require both the device availability and `openwrt/{id}/mwan3/availability` to be online. A failed/stopped RPC marks only mwan3 sensors unavailable, without leaving stale healthy readings or taking unrelated system sensors offline. Updates follow the existing fast poll (default 60 seconds); they are monitoring only and do not control routing. Restart discovery after adding interfaces or policies. Routers with no mwan3 config skip monitoring.
 
