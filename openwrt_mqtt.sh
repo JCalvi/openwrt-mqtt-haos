@@ -1,7 +1,7 @@
 #!/bin/sh
 #
 # OpenWrt WiFi MQTT Publisher for Home Assistant
-# Version: 1.2.8
+# Version: 1.2.9
 #
 # Commands:
 #   /root/openwrt_mqtt.sh install
@@ -23,7 +23,7 @@
 #   /etc/init.d/openwrt_mqtt
 #
 
-VERSION="1.2.8"
+VERSION="1.2.9"
 CONFIG="openwrt_mqtt"
 SCRIPT="/root/openwrt_mqtt.sh"
 SERVICE="/etc/init.d/openwrt_mqtt"
@@ -426,7 +426,7 @@ mwan_sections() {
 
 mwan_sensor() {
   MW_UID="${DEVICE_ID}_mwan_$1"
-  discovery_pub -r -t "${DISC}/sensor/${MW_UID}/config" \
+  discovery_pub -r -t "${DISC}/${5:-sensor}/${MW_UID}/config" \
     -m "{\"name\":\"$(json_escape "$2")\",\"unique_id\":\"${MW_UID}\",\"state_topic\":\"${BASE}/mwan3/state\",\"availability\":[{\"topic\":\"${BASE}/availability\"},{\"topic\":\"${BASE}/mwan3/availability\"}],\"availability_mode\":\"all\",\"value_template\":\"$(json_escape "$3")\",$4${DEVICE}}"
 }
 
@@ -434,6 +434,7 @@ mwan_discovery() {
   [ -f /etc/config/mwan3 ] || return 0
   for MI in $(mwan_sections interface); do
     mwan_sensor "${MI}_status" "MWAN ${MI} Status" "{{ value_json.interfaces.get('$MI', {}).get('status', 'unknown') }}" ''
+    mwan_sensor "${MI}_connected" "MWAN ${MI} Connected" "{{ 'true' if value_json.interfaces.get('$MI', {}).get('status') == 'online' else 'false' }}" '"device_class":"connectivity","payload_on":"true","payload_off":"false",' binary_sensor
     mwan_sensor "${MI}_online" "MWAN ${MI} Online Duration" "{% set s = value_json.interfaces.get('$MI', {}).get('online', 0) | int(0) %}{% if s < 3600 %}{{ s // 60 }}m {{ s % 60 }}s{% elif s < 86400 %}{{ s // 3600 }}h {{ s % 3600 // 60 }}m{% else %}{{ s // 86400 }}d {{ s % 86400 // 3600 }}h{% endif %}" '"icon":"mdi:timer-outline",'
   done
   for MP in $(mwan_sections policy); do
