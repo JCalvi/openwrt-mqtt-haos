@@ -1,8 +1,14 @@
 # openwrt-mqtt-haos
 
-**Version 1.2.8** — publishes OpenWrt router Wi-Fi and system statistics to Home Assistant using MQTT discovery, with device-wide availability monitoring and automatic reconnection.
+**Version 1.2.9** — publishes OpenWrt router Wi-Fi and system statistics to Home Assistant using MQTT discovery, with device-wide availability monitoring and automatic reconnection.
 
 Tested on GL-MT6000 running Alpine-based OpenWrt.
+
+## v1.2.9: connectivity sensors for IT OK groups
+
+Each configured MWAN interface now also has a connectivity binary sensor named **MWAN wan Connected**, **MWAN mobile Connected**, **MWAN wan6 Connected**, etc. These are selectable in HA binary-sensor groups. Connected means MWAN status is exactly `online`; offline, connecting, disabled, missing and other statuses mean Disconnected. Device/MWAN availability applies to these sensors too.
+
+Existing text status and duration sensors remain unchanged. Update the script and restart the service to republish discovery. Add the four connectivity sensors to your IT OK group and enable **All entities** if every member must be connected. HA group handling of unknown/unavailable members should be checked separately; All entities is not a strict availability check.
 
 ## v1.2.7: wired routers and mwan3 failover monitoring
 
