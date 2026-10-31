@@ -1,8 +1,33 @@
 # openwrt-mqtt-haos
 
-**Version 1.2.6** — publishes OpenWrt router Wi-Fi and system statistics to Home Assistant using MQTT discovery, with device-wide availability monitoring and automatic reconnection.
+**Version 1.2.7** — publishes OpenWrt router Wi-Fi and system statistics to Home Assistant using MQTT discovery, with device-wide availability monitoring and automatic reconnection.
 
 Tested on GL-MT6000 running Alpine-based OpenWrt.
+
+## v1.2.7: wired routers and mwan3 failover monitoring
+
+Install this publisher on **OpenWrt-101**, where mwan3 runs, to monitor end-to-end failover. Wi-Fi tools are optional; no `iw` installation is required on a wired VM. Existing Wi-Fi and system entities retain their IDs and topics.
+
+With native nftables mwan3 configured, discovery adds interface status and online-duration sensors, policy member percentages, and the active connection for each configured policy/address family. For the documented setup this gives:
+
+- Status and online duration for `wan`, `mobile`, `wan6`, `mobile6`.
+- `failover`: wan/mobile percentages and active IPv4 connection.
+- `failover6`: wan6/mobile6 percentages and active IPv6 connection.
+
+Online duration is published as seconds with HA's duration device class. Percentages are mwan3 policy allocations, **not measured bandwidth usage**. Zero percent means standby. Multiple active members are listed when load balancing. Data comes from `ubus -t 5 call mwan3 status`, the structured RPC used by LuCI, not the CLI summary that can omit IPv6 policies. This requires native mwan3's RPC and `ubus`/`jsonfilter`.
+
+The retained JSON topic is `openwrt/{id}/mwan3/state`. Sensors require both the device availability and `openwrt/{id}/mwan3/availability` to be online. A failed/stopped RPC marks only mwan3 sensors unavailable, without leaving stale healthy readings or taking unrelated system sensors offline. Updates follow the existing fast poll (default 60 seconds); they are monitoring only and do not control routing. Restart discovery after adding interfaces or policies. Routers with no mwan3 config skip monitoring.
+
+### Install on VM101
+
+```sh
+wget -O /tmp/openwrt_mqtt.sh https://raw.githubusercontent.com/JCalvi/openwrt-mqtt-haos/main/openwrt_mqtt.sh
+sh -n /tmp/openwrt_mqtt.sh && cp /tmp/openwrt_mqtt.sh /root/openwrt_mqtt.sh
+chmod 755 /root/openwrt_mqtt.sh
+/root/openwrt_mqtt.sh install
+```
+
+Enter your existing HA MQTT broker details. For an already configured publisher use the noninteractive upgrade instructions below instead. In HA, find the **OpenWrt-101** MQTT device. Verify WAN unplug/reconnect changes both active-connection sensors after a poll. Live router/HA validation is required; local fixtures do not replace that check.
 
 ## Screenshot
 
@@ -79,7 +104,7 @@ SSIDs are auto-detected from `iw dev` at discovery time. Each SSID gets its own 
 
 - OpenWrt with `apk` packaging (tested on OpenWrt 25.x / GL-MT6000)
 - `mosquitto-client-nossl` — installed automatically by the script
-- `iw` — included in OpenWrt by default
+- `iw` — optional, required only for Wi-Fi readings
 - `uci` — included in OpenWrt by default
 - Home Assistant with the MQTT integration enabled and a broker (e.g. Mosquitto add-on)
 
@@ -292,3 +317,4 @@ uci delete openwrt_mqtt.@mqtt[0]
 uci commit openwrt_mqtt
 rm /etc/config/openwrt_mqtt
 ```
+

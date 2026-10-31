@@ -1,7 +1,7 @@
 #!/bin/sh
 #
 # OpenWrt WiFi MQTT Publisher for Home Assistant
-# Version: 1.2.6
+# Version: 1.2.7
 #
 # Commands:
 #   /root/openwrt_mqtt.sh install
@@ -23,7 +23,7 @@
 #   /etc/init.d/openwrt_mqtt
 #
 
-VERSION="1.2.6"
+VERSION="1.2.7"
 CONFIG="openwrt_mqtt"
 SCRIPT="/root/openwrt_mqtt.sh"
 SERVICE="/etc/init.d/openwrt_mqtt"
@@ -84,11 +84,6 @@ load_config() {
 check_requirements() {
   command -v mosquitto_pub >/dev/null 2>&1 || {
     echo "Missing mosquitto_pub. Install with: apk add mosquitto-client-nossl"
-    exit 1
-  }
-
-  command -v iw >/dev/null 2>&1 || {
-    echo "Missing iw."
     exit 1
   }
 
@@ -198,6 +193,7 @@ publish_binary_sensor() {
 }
 
 wifi_list() {
+  command -v iw >/dev/null 2>&1 || return 0
   iw dev | awk '
     /Interface/ { iface=$2 }
     /^[[:space:]]*ssid / { ssid=$2 }
@@ -419,11 +415,62 @@ do_discovery() {
     DISCOVERY_FAILED=1
   fi
 
+  mwan_discovery
   [ "$DISCOVERY_FAILED" -eq 0 ]
 }
 
+# Read the native nftables mwan3 RPC used by LuCI, including IPv6 policies.
+mwan_sections() {
+  uci -q show mwan3 | sed -n "s/^mwan3[.]\([a-zA-Z0-9_]*\)=$1$/\1/p"
+}
+
+mwan_sensor() {
+  MW_UID="${DEVICE_ID}_mwan_$1"
+  discovery_pub -r -t "${DISC}/sensor/${MW_UID}/config" \
+    -m "{\"name\":\"$(json_escape "$2")\",\"unique_id\":\"${MW_UID}\",\"state_topic\":\"${BASE}/mwan3/state\",\"availability\":[{\"topic\":\"${BASE}/availability\"},{\"topic\":\"${BASE}/mwan3/availability\"}],\"availability_mode\":\"all\",\"value_template\":\"$(json_escape "$3")\",$4${DEVICE}}"
+}
+
+mwan_discovery() {
+  [ -f /etc/config/mwan3 ] || return 0
+  for MI in $(mwan_sections interface); do
+    mwan_sensor "${MI}_status" "MWAN ${MI} Status" "{{ value_json.interfaces.get('$MI', {}).get('status', 'unknown') }}" ''
+    mwan_sensor "${MI}_online" "MWAN ${MI} Online Duration" "{{ value_json.interfaces.get('$MI', {}).get('online', 0) | int(0) }}" '"device_class":"duration","unit_of_measurement":"s",'
+  done
+  for MP in $(mwan_sections policy); do
+    for MF in ipv4 ipv6; do
+      MW_MEMBERS=''
+      for MM in $(uci -q get "mwan3.$MP.use_member"); do
+        MI="$(uci -q get "mwan3.$MM.interface")"
+        [ "$(uci -q get "mwan3.$MI.family")" = "$MF" ] || continue
+        case "$MI" in ''|*[!a-zA-Z0-9_]*) continue ;; esac
+        case " $MW_MEMBERS " in *" $MI "*) continue ;; esac
+        MW_MEMBERS="$MW_MEMBERS $MI"
+        mwan_sensor "${MP}_${MF}_${MI}_percent" "MWAN ${MP} ${MI} Allocation" "{% set ns = namespace(p=0) %}{% for m in value_json.policies.get('$MF', {}).get('$MP', []) %}{% if m.interface == '$MI' %}{% set ns.p = m.percent %}{% endif %}{% endfor %}{{ ns.p }}" '"unit_of_measurement":"%",'
+      done
+      [ -n "$MW_MEMBERS" ] || continue
+      mwan_sensor "${MP}_${MF}_active" "MWAN ${MP} ${MF} Active Connection" "{% set ns = namespace(active=[]) %}{% for m in value_json.policies.get('$MF', {}).get('$MP', []) %}{% if m.percent | float(0) > 0 %}{% set ns.active = ns.active + [m.interface] %}{% endif %}{% endfor %}{{ ns.active | join(', ') if ns.active else 'none' }}" ''
+    done
+  done
+}
+
+publish_mwan() {
+  [ -f /etc/config/mwan3 ] || return 0
+  MW_STATE="$(ubus -t 5 call mwan3 status 2>/dev/null)"
+  if [ -z "$MW_STATE" ] || ! printf '%s' "$MW_STATE" | jsonfilter -e '@.interfaces' >/dev/null 2>&1; then
+    # Invalidate stale healthy readings if mwan3 is stopped or missing.
+    pub -r -t "${BASE}/mwan3/availability" -m offline
+    return $?
+  fi
+  MW_HASH="$(printf '%s' "$MW_STATE" | sha256sum | awk '{print $1}')"
+  if [ "$MW_HASH" != "$(cat /tmp/openwrt_mqtt_mwan.hash 2>/dev/null)" ]; then
+    pub -r -t "${BASE}/mwan3/state" -m "$MW_STATE" || return 1
+    printf '%s\n' "$MW_HASH" > /tmp/openwrt_mqtt_mwan.hash || return 1
+  fi
+  pub -r -t "${BASE}/mwan3/availability" -m online
+}
+
 build_state() {
-  TOTAL_CLIENTS="$(iw dev | awk '/Interface/ {print $2}' | while read -r IFACE; do iw dev "$IFACE" station dump 2>/dev/null | grep -c '^Station'; done | awk '{s+=$1} END {print s+0}')"
+  TOTAL_CLIENTS="$(iw dev 2>/dev/null | awk '/Interface/ {print $2}' | while read -r IFACE; do iw dev "$IFACE" station dump 2>/dev/null | grep -c '^Station'; done | awk '{s+=$1} END {print s+0}')"
 
   STATE="{\"healthy\":true,\"clients_total\":${TOTAL_CLIENTS}}"
 
@@ -506,6 +553,10 @@ do_publish() {
 
   FAILED=0
 
+  if ! publish_mwan; then
+    FAILED=1
+  fi
+
   if ! publish_state; then
     FAILED=1
     logger -t openwrt_mqtt 'MQTT fast-state publish failed; will retry'
@@ -578,7 +629,7 @@ terminate_daemon() {
 
 do_daemon_session() {
   # Force a full republish on each new MQTT connection or broker recovery.
-  rm -f "$STATE_HASH_FILE" "$HEARTBEAT_FILE"
+  rm -f "$STATE_HASH_FILE" "$HEARTBEAT_FILE" /tmp/openwrt_mqtt_mwan.hash
   rm -rf "$SSID_HASH_DIR"
 
   SESSION_FIFO="/tmp/openwrt_mqtt_$$.fifo"

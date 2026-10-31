@@ -26,3 +26,5 @@ jobs:
           sh -n tests/test_service_lifecycle.sh
           sh tests/test_telemetry_publish.sh
           sh tests/test_service_lifecycle.sh
+
+          python3 tests/test_mwan.py
