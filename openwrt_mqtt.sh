@@ -1,7 +1,7 @@
 #!/bin/sh
 #
 # OpenWrt WiFi MQTT Publisher for Home Assistant
-# Version: 1.2.7
+# Version: 1.2.8
 #
 # Commands:
 #   /root/openwrt_mqtt.sh install
@@ -23,7 +23,7 @@
 #   /etc/init.d/openwrt_mqtt
 #
 
-VERSION="1.2.7"
+VERSION="1.2.8"
 CONFIG="openwrt_mqtt"
 SCRIPT="/root/openwrt_mqtt.sh"
 SERVICE="/etc/init.d/openwrt_mqtt"
@@ -434,7 +434,7 @@ mwan_discovery() {
   [ -f /etc/config/mwan3 ] || return 0
   for MI in $(mwan_sections interface); do
     mwan_sensor "${MI}_status" "MWAN ${MI} Status" "{{ value_json.interfaces.get('$MI', {}).get('status', 'unknown') }}" ''
-    mwan_sensor "${MI}_online" "MWAN ${MI} Online Duration" "{{ value_json.interfaces.get('$MI', {}).get('online', 0) | int(0) }}" '"device_class":"duration","unit_of_measurement":"s",'
+    mwan_sensor "${MI}_online" "MWAN ${MI} Online Duration" "{% set s = value_json.interfaces.get('$MI', {}).get('online', 0) | int(0) %}{% if s < 3600 %}{{ s // 60 }}m {{ s % 60 }}s{% elif s < 86400 %}{{ s // 3600 }}h {{ s % 3600 // 60 }}m{% else %}{{ s // 86400 }}d {{ s % 86400 // 3600 }}h{% endif %}" '"icon":"mdi:timer-outline",'
   done
   for MP in $(mwan_sections policy); do
     for MF in ipv4 ipv6; do
