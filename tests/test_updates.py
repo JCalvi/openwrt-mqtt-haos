@@ -16,7 +16,7 @@ class Updates(unittest.TestCase):
             root=Path(d)
             for name, data in (files or {}).items():
                 (root/name).write_text(data)
-            (root/'installed').write_text('#!/bin/sh\nVERSION="1.4.1"\n')
+            (root/'installed').write_text('#!/bin/sh\nVERSION="1.4.2"\n')
             (root/'filter.py').write_text('''import json,sys
 args=sys.argv
 try: print(json.load(open(args[args.index('-i')+1]))[args[args.index('-e')+1][2:]])
@@ -30,6 +30,7 @@ DEVICE_ID=test
 DISC=homeassistant
 DEVICE='"device":{"identifiers":["test"]}'
 pub() {
+ printf '%s\n' "$*" >> "$OUT/publications"
  destination=state
  while [ "$#" -gt 0 ]; do
   if [ "$1" = -t ]; then shift; case "$1" in */update/status) destination=status ;; esac; fi
@@ -38,6 +39,7 @@ pub() {
  done
 }
 discovery_pub() { pub "$@"; }
+logger() { printf '%s\n' "$*" >> "$OUT/log"; }
 jsonfilter() { python3 "$OUT/filter.py" "$@"; }
 is_our_daemon_pid() { return 1; }
 update_download() {
@@ -64,27 +66,27 @@ update_download() {
         r,f=self.install()
         self.assertEqual(r.returncode,0,r.stderr)
         self.assertIn('1.5.0',f['installed'])
-        self.assertIn('1.4.1',f['installed.bak'])
+        self.assertIn('1.4.2',f['installed.bak'])
         self.assertFalse(any('lock' in p or '.new.' in p or '/work.' in p for p in f))
         states=[json.loads(s) for s in f['state'].splitlines()]
         self.assertTrue(states[0]['in_progress'])
-        self.assertEqual(f['status'].splitlines()[-1],'Installed; restarting publisher')
+        self.assertIn('Installed; restarting publisher',f['log'])
 
     def test_failed_validation_never_replaces(self):
         for mode in ('hash','syntax','version','manifest'):
             with self.subTest(mode=mode):
                 r,f=self.install(mode)
                 self.assertNotEqual(r.returncode,0)
-                self.assertIn('1.4.1',f['installed'])
+                self.assertIn('1.4.2',f['installed'])
                 self.assertNotIn('installed.bak',f)
                 self.assertFalse(json.loads(f['state'].splitlines()[-1])['in_progress'])
 
     def test_equal_or_older_never_installs(self):
-        for version in ('1.4.1','1.3.99','0.99.0'):
+        for version in ('1.4.2','1.3.99','0.99.0'):
             r,f=self.install(version=version)
             self.assertEqual(r.returncode,0,r.stderr)
             self.assertNotIn('installed.bak',f)
-            self.assertIn('1.4.1',f['installed'])
+            self.assertIn('1.4.2',f['installed'])
 
     def test_check_only_never_installs(self):
         manifest={'version':'1.5.0','commit':'a'*40,'sha256':'b'*64}
@@ -96,7 +98,7 @@ update_download() {
     def test_download_failure_clears_progress(self):
         r,f=self.run_shell('update_download() { return 7; }; update_operation install\n')
         self.assertNotEqual(r.returncode,0)
-        self.assertEqual(f['status'].strip(),'Check failed')
+        self.assertIn('Check failed',f['log'])
         self.assertNotIn('installed.bak',f)
 
     def test_discovery_is_router_scoped_and_manual(self):
@@ -147,14 +149,16 @@ update_listener
         allowed={'installed_version','latest_version','title','release_summary',
                  'release_url','entity_picture','in_progress','update_percentage'}
         self.assertLessEqual(set(payload),allowed)
-        self.assertEqual(payload['installed_version'],'1.4.1')
+        self.assertEqual(payload['installed_version'],'1.4.2')
         self.assertEqual(payload['latest_version'],'1.5.0')
         self.assertIs(payload['in_progress'],False)
-        self.assertEqual(f['status'].strip(),'Checked')
+        self.assertNotIn('status',f)
+        self.assertNotIn('log',f)
         r,f=self.run_shell('update_discovery\n')
         configs=[json.loads(line) for line in f['state'].splitlines()]
-        self.assertEqual(configs[1]['state_topic'],'openwrt/test/update/status')
-        self.assertNotIn('value_template',configs[1])
+        self.assertEqual(len(configs),1)
+        self.assertIn('-r -n -t homeassistant/sensor/test/publisher_update_status/config',f['publications'])
+        self.assertIn('-r -n -t openwrt/test/update/status',f['publications'])
 
     def test_usb_detection(self):
         for route,path,expected in [
