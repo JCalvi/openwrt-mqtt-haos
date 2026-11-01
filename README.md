@@ -1,8 +1,14 @@
 # openwrt-mqtt-haos
 
-**Version 1.4.0** — publishes OpenWrt Wi-Fi, system, MWAN and optional ZTE MF833V mobile-modem readings to Home Assistant using MQTT discovery.
+**Version 1.4.1** — publishes OpenWrt Wi-Fi, system, MWAN and optional ZTE MF833V mobile-modem readings to Home Assistant using MQTT discovery.
 
 Tested on GL-MT6000 running Alpine-based OpenWrt.
+
+## v1.4.1: fix Unknown update entity
+
+Home Assistant strictly rejects extra fields in an MQTT Update JSON payload. v1.4.0 included a diagnostic `status` field, so HA could show the diagnostic sensor while leaving the update entity Unknown. v1.4.1 publishes that status separately on `openwrt/{id}/update/status` and keeps only supported fields on `update/state`. Existing entity IDs are preserved and discovery migrates the diagnostic sensor automatically. There is no new polling or timer. An added regression test checks the update payload's keys against HA's supported schema.
+
+If already running v1.4.0, run `/root/openwrt_mqtt.sh update` in SSH after the release manifest is published. The manual updater works even when HA cannot parse its update entity. procd respawns the telemetry daemon; the existing command listener refreshes itself on its next handled request, or restart the service to refresh both instances immediately.
 
 ## v1.4.0: automatic local modem detection and HA updates
 
