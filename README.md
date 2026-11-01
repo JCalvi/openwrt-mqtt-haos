@@ -1,8 +1,39 @@
 # openwrt-mqtt-haos
 
-**Version 1.2.9** — publishes OpenWrt router Wi-Fi and system statistics to Home Assistant using MQTT discovery, with device-wide availability monitoring and automatic reconnection.
+**Version 1.3.0** — publishes OpenWrt Wi-Fi, system, MWAN and optional ZTE MF833V mobile-modem readings to Home Assistant using MQTT discovery.
 
 Tested on GL-MT6000 running Alpine-based OpenWrt.
+
+## v1.3.0: ZTE MF833V signal, band and data usage
+
+Optional modem monitoring adds **10 sensors** to the hosting router's MQTT device: Mobile Network, Band, Signal RSRP (dBm), Signal Bars (0–5), and download/upload/total data for both the current connection session and the modem's monthly counters. Band `LTE BAND 3` is displayed as `B3`. MQTT carries byte counters; discovery templates convert to decimal GB for HA statistics and display (two decimal places).
+
+Enable **only on the router physically hosting the dongle**, e.g. GL-MT6000-Upstairs. VM101 can continue publishing MWAN status separately. Existing entities, topics and credentials remain unchanged. Monitoring is disabled by default, makes no routing changes and does not alter modem settings.
+
+After updating the script using the upgrade instructions below:
+
+```sh
+/root/openwrt_mqtt.sh configure-modem
+/etc/init.d/openwrt_mqtt restart
+```
+
+Accept the modem address `192.168.11.1` and enter its **web-interface password** at the hidden prompt. The setup command installs missing `curl`, `coreutils-base64`, `jsonfilter` and `jshn` dependencies. It writes a named `modem` section in `/etc/config/openwrt_mqtt`, sets this file to mode 600, and stores the Base64 password as `password_b64`. **Base64 is reversible encoding, not encryption**; treat configuration backups as credentials. The password is not placed in curl command arguments, logs or MQTT payloads.
+
+The polling code follows the confirmed Telstra `MF833V_M02_T` web API: Base64 LOGIN, session cookies, Referer header, `loginfo`, `lte_rsrp`, `wan_active_band`, and byte counters. It checks the session each poll and logs in again when needed. Login attempts are limited to one every five minutes, including failed attempts, to avoid hammering the modem's account lockout. Unsupported firmware authentication methods are not tried automatically.
+
+Modem readings follow the fast poll (60 seconds by default). Only changed payloads are published to `openwrt/{id}/modem/state`; `openwrt/{id}/modem/availability` handles modem-specific failures, while the router's shared LWT still applies. A missing dongle, expired session with failed login, or missing dependency makes modem entities unavailable without taking Wi-Fi/system/MWAN readings offline. Invalid individual readings become unknown, never fabricated zero readings. Traffic counters above 4 GB avoid 32-bit shell arithmetic.
+
+**Usage is measured by the dongle, not ALDI's billing balance.** Session counters can reset on reconnect/reboot; monthly counters follow the modem's own reset settings. HA uses `total_increasing` to handle observed resets, but cannot recover traffic between the last sample and an unobserved reset. Figures are approximate, not a reliable billing allowance. The modem's successful authenticated signal/band query and unauthenticated traffic query were validated on the actual router; the integrated publisher still needs a live HA check after installation.
+
+Disable and retain existing entities as unavailable:
+
+```sh
+uci set openwrt_mqtt.modem.enabled='0'
+uci commit openwrt_mqtt
+/etc/init.d/openwrt_mqtt restart
+```
+
+The modem config is preserved with the existing MQTT config across firmware upgrades. Cookies and retry/cache files live only in private `/tmp` storage. Include the modem dependencies in Attended Sysupgrade package selection. Modem entities are associated with the hosting router, not the SIM/IMEI, so replacing a dongle keeps history but may reset usage counters. Tests: `python3 tests/test_modem.py`.
 
 ## v1.2.9: connectivity sensors for IT OK groups
 
@@ -323,4 +354,5 @@ uci delete openwrt_mqtt.@mqtt[0]
 uci commit openwrt_mqtt
 rm /etc/config/openwrt_mqtt
 ```
+
 
