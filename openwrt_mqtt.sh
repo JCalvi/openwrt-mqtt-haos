@@ -1,7 +1,7 @@
 #!/bin/sh
 #
 # OpenWrt WiFi MQTT Publisher for Home Assistant
-# Version: 1.4.1
+# Version: 1.4.2
 #
 # Commands:
 #   /root/openwrt_mqtt.sh install
@@ -23,7 +23,7 @@
 #   /etc/init.d/openwrt_mqtt
 #
 
-VERSION="1.4.1"
+VERSION="1.4.2"
 CONFIG="openwrt_mqtt"
 SCRIPT="/root/openwrt_mqtt.sh"
 SERVICE="/etc/init.d/openwrt_mqtt"
@@ -659,13 +659,19 @@ install_update_dependencies() {
 
 update_discovery() {
   discovery_pub -r -t "$DISC/update/${DEVICE_ID}/publisher/config" -m "{\"name\":\"MQTT Publisher\",\"unique_id\":\"${DEVICE_ID}_publisher_update\",\"state_topic\":\"$BASE/update/state\",\"command_topic\":\"$BASE/update/install\",\"payload_install\":\"INSTALL\",\"retain\":false,\"entity_category\":\"config\",\"availability_topic\":\"$BASE/availability\",$DEVICE}"
-  discovery_pub -r -t "$DISC/sensor/${DEVICE_ID}/publisher_update_status/config" -m "{\"name\":\"Publisher Update Status\",\"unique_id\":\"${DEVICE_ID}_publisher_update_status\",\"state_topic\":\"$BASE/update/status\",\"entity_category\":\"diagnostic\",\"availability_topic\":\"$BASE/availability\",$DEVICE}"
+  # Remove the obsolete diagnostic entity and its retained state on discovery.
+  discovery_pub -r -n -t "$DISC/sensor/${DEVICE_ID}/publisher_update_status/config"
+  discovery_pub -r -n -t "$BASE/update/status"
 }
 
 update_state() {
+  # Failure details belong in the router log, not a second HA entity.
+  case "$1" in
+    Checked|'Up to date') ;;
+    *) logger -t openwrt_mqtt "Publisher update: $1" ;;
+  esac
   # Versions and commit are validated before use; all other strings are constants.
-  pub -r -q 1 -t "$BASE/update/state" -m "{\"installed_version\":\"$VERSION\",\"latest_version\":\"${UPDATE_VERSION:-$VERSION}\",\"in_progress\":$2,\"title\":\"OpenWrt MQTT Publisher\",\"release_url\":\"https://github.com/JCalvi/openwrt-mqtt-haos\",\"release_summary\":\"Updates the publisher script only; router firmware and settings are preserved.\"}" || return 1
-  pub -r -q 1 -t "$BASE/update/status" -m "$1"
+  pub -r -q 1 -t "$BASE/update/state" -m "{\"installed_version\":\"$VERSION\",\"latest_version\":\"${UPDATE_VERSION:-$VERSION}\",\"in_progress\":$2,\"title\":\"OpenWrt MQTT Publisher\",\"release_url\":\"https://github.com/JCalvi/openwrt-mqtt-haos\",\"release_summary\":\"Updates the publisher script only; router firmware and settings are preserved.\"}"
 }
 
 update_dir() {
