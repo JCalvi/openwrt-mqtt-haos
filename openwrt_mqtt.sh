@@ -1,7 +1,7 @@
 #!/bin/sh
 #
 # OpenWrt WiFi MQTT Publisher for Home Assistant
-# Version: 1.2.9
+# Version: 1.3.0
 #
 # Commands:
 #   /root/openwrt_mqtt.sh install
@@ -23,7 +23,7 @@
 #   /etc/init.d/openwrt_mqtt
 #
 
-VERSION="1.2.9"
+VERSION="1.3.0"
 CONFIG="openwrt_mqtt"
 SCRIPT="/root/openwrt_mqtt.sh"
 SERVICE="/etc/init.d/openwrt_mqtt"
@@ -59,6 +59,9 @@ load_config() {
   DISC="$(uci -q get ${CONFIG}.@mqtt[0].discovery_prefix)"
   HEARTBEAT_SECONDS="$(uci -q get ${CONFIG}.@mqtt[0].heartbeat)"
   POLL_SECONDS="$(uci -q get ${CONFIG}.@mqtt[0].poll_interval)"
+  MODEM_ENABLED="$(uci -q get ${CONFIG}.modem.enabled)"
+  MODEM_HOST="$(uci -q get ${CONFIG}.modem.host)"
+  [ -n "$MODEM_HOST" ] || MODEM_HOST=192.168.11.1
 
   [ -z "$MQTT_HOST" ]         && MQTT_HOST="192.168.1.20"
   [ -z "$MQTT_USER" ]         && MQTT_USER="openwrt"
@@ -416,8 +419,160 @@ do_discovery() {
   fi
 
   mwan_discovery
+  modem_discovery
   [ "$DISCOVERY_FAILED" -eq 0 ]
 }
+
+# Optional Telstra MF833V telemetry. Credentials never enter curl arguments,
+# MQTT payloads or logs. Cookies and retry state live only in private /tmp.
+modem_host_valid() {
+  case "$MODEM_HOST" in ''|*[!a-zA-Z0-9.-]*) return 1 ;; esac
+}
+
+configure_modem() (
+  umask 077
+  command -v curl >/dev/null 2>&1 || apk add curl || exit 1
+  command -v base64 >/dev/null 2>&1 || apk add coreutils-base64 || exit 1
+  command -v jsonfilter >/dev/null 2>&1 || apk add jsonfilter || exit 1
+  [ -r /usr/share/libubox/jshn.sh ] || apk add jshn || exit 1
+  prompt MODEM_HOST 'Modem IP/hostname' '192.168.11.1'
+  modem_host_valid || { echo 'Invalid modem hostname' >&2; exit 1; }
+  printf 'Modem web password (hidden): '
+  read -r -s MODEM_PASSWORD || exit 1
+  echo
+  [ -n "$MODEM_PASSWORD" ] || { echo 'Password must not be empty' >&2; exit 1; }
+  # Encode for storage to keep quotes/newlines out of the UCI batch language.
+  MODEM_PASSWORD_B64=$(printf '%s' "$MODEM_PASSWORD" | base64) || exit 1
+  MODEM_PASSWORD_B64=$(printf '%s' "$MODEM_PASSWORD_B64" | tr -d '\n')
+  unset MODEM_PASSWORD
+  [ -f "/etc/config/$CONFIG" ] || { echo 'Configure MQTT with install first' >&2; exit 1; }
+  chmod 600 "/etc/config/$CONFIG" || exit 1
+  printf "set %s.modem=modem\nset %s.modem.enabled='1'\nset %s.modem.host='%s'\nset %s.modem.password_b64='%s'\ncommit %s\n" "$CONFIG" "$CONFIG" "$CONFIG" "$MODEM_HOST" "$CONFIG" "$MODEM_PASSWORD_B64" "$CONFIG" | uci batch || exit 1
+  echo 'Modem configured. Restart openwrt_mqtt to publish discovery.'
+)
+
+modem_sensor() {
+  discovery_pub -r -t "${DISC}/sensor/${DEVICE_ID}_modem_$1/config" \
+    -m "{\"name\":\"Mobile $2\",\"unique_id\":\"${DEVICE_ID}_modem_$1\",\"state_topic\":\"${BASE}/modem/state\",\"availability\":[{\"topic\":\"${BASE}/availability\"},{\"topic\":\"${BASE}/modem/availability\"}],\"availability_mode\":\"all\",\"value_template\":\"$(json_escape "$3")\",$4${DEVICE}}"
+}
+
+modem_discovery() {
+  [ "$MODEM_ENABLED" = 1 ] || return 0
+  modem_sensor network 'Network' "{{ value_json.get('network_type') or none }}" '"icon":"mdi:network",'
+  modem_sensor band 'Band' "{{ value_json.get('band') or none }}" '"icon":"mdi:antenna",'
+  modem_sensor signal 'Signal RSRP' "{{ value_json.get('lte_rsrp') }}" '"device_class":"signal_strength","unit_of_measurement":"dBm","state_class":"measurement",'
+  modem_sensor bars 'Signal Bars' "{{ value_json.get('signalbar') }}" '"icon":"mdi:signal","state_class":"measurement",'
+  for PERIOD in session monthly; do
+    for DIRECTION in download upload total; do
+      modem_sensor "${PERIOD}_${DIRECTION}" "${PERIOD} ${DIRECTION}" "{% set v = value_json.get('${PERIOD}_${DIRECTION}') %}{{ (v | float / 1000000000) if v is not none else none }}" '"device_class":"data_size","unit_of_measurement":"GB","state_class":"total_increasing","suggested_display_precision":2,'
+    done
+  done
+}
+
+modem_get() {
+  curl -fsS --noproxy '*' --connect-timeout 3 --max-time 10 --max-filesize 32768 \
+    -b "$MODEM_DIR/cookies" -c "$MODEM_DIR/cookies" -e "http://$MODEM_HOST/" \
+    "http://$MODEM_HOST/goform/goform_get_cmd_process?isTest=false&multi_data=1&cmd=loginfo,network_type,signalbar,lte_rsrp,wan_active_band,realtime_rx_bytes,realtime_tx_bytes,monthly_rx_bytes,monthly_tx_bytes" \
+    -o "$MODEM_DIR/response" 2>/dev/null
+}
+
+modem_field() { jsonfilter -i "$MODEM_DIR/response" -e "@.$1" 2>/dev/null; }
+
+modem_number() {
+  MODEM_VALUE=$(modem_field "$2")
+  case "$MODEM_VALUE" in ''|*[!0-9]*) json_add_null "$1" ;; *)
+    # Reject implausible counters rather than feeding corrupt totals to HA.
+    if [ "${#MODEM_VALUE}" -le 15 ]; then json_add_string "$1" "$MODEM_VALUE"; else json_add_null "$1"; fi ;;
+  esac
+}
+
+modem_normalize() (
+  . /usr/share/libubox/jshn.sh || exit 1
+  json_init
+  json_add_string network_type "$(modem_field network_type)"
+  MODEM_BAND=$(modem_field wan_active_band)
+  case "$MODEM_BAND" in 'LTE BAND '*) MODEM_BAND="B${MODEM_BAND#LTE BAND }" ;; esac
+  json_add_string band "$MODEM_BAND"
+  MODEM_SIGNAL=$(modem_field lte_rsrp)
+  case "$MODEM_SIGNAL" in -[0-9]|-[0-9][0-9]|-[0-9][0-9][0-9])
+    if [ "$MODEM_SIGNAL" -ge -160 ] && [ "$MODEM_SIGNAL" -le -30 ]; then json_add_int lte_rsrp "$MODEM_SIGNAL"; else json_add_null lte_rsrp; fi ;;
+    *) json_add_null lte_rsrp ;;
+  esac
+  MODEM_BARS=$(modem_field signalbar)
+  case "$MODEM_BARS" in [0-5]) json_add_int signalbar "$MODEM_BARS" ;; *) json_add_null signalbar ;; esac
+  modem_number session_download realtime_rx_bytes
+  modem_number session_upload realtime_tx_bytes
+  modem_number monthly_download monthly_rx_bytes
+  modem_number monthly_upload monthly_tx_bytes
+  for PERIOD in session monthly; do
+    json_get_var MODEM_RX "${PERIOD}_download"
+    json_get_var MODEM_TX "${PERIOD}_upload"
+    if [ -n "$MODEM_RX" ] && [ -n "$MODEM_TX" ]; then
+      # awk avoids 32-bit shell arithmetic overflow on smaller routers.
+      json_add_string "${PERIOD}_total" "$(awk -v rx="$MODEM_RX" -v tx="$MODEM_TX" 'BEGIN {printf "%.0f",rx+tx}')"
+    else json_add_null "${PERIOD}_total"; fi
+  done
+  json_dump
+)
+
+publish_modem() (
+  if [ "$MODEM_ENABLED" != 1 ]; then
+    if [ -d /tmp/openwrt_mqtt_modem ] || [ "$(uci -q get "$CONFIG.modem")" = modem ]; then pub -r -t "$BASE/modem/availability" -m offline; else return 0; fi
+    exit $?
+  fi
+  modem_host_valid || { pub -r -t "$BASE/modem/availability" -m offline; exit $?; }
+  MODEM_DIR=/tmp/openwrt_mqtt_modem
+  umask 077
+  [ ! -L "$MODEM_DIR" ] || exit 1
+  mkdir -p "$MODEM_DIR" && chmod 700 "$MODEM_DIR" || exit 1
+  # Serialize manual publishes with the service; reclaim a dead owner's lock.
+  if ! mkdir "$MODEM_DIR/lock" 2>/dev/null; then
+    MODEM_OWNER=$(cat "$MODEM_DIR/lock/pid" 2>/dev/null)
+    case "$MODEM_OWNER" in ''|*[!0-9]*) exit 0 ;; esac
+    kill -0 "$MODEM_OWNER" 2>/dev/null && exit 0
+    rm -f "$MODEM_DIR/lock/pid"
+    rmdir "$MODEM_DIR/lock" 2>/dev/null && mkdir "$MODEM_DIR/lock" 2>/dev/null || exit 0
+  fi
+  # $$ stays the parent shell's PID in POSIX subshells. Ask a child for
+  # its real parent instead, so a killed poll does not leave a live lock.
+  sh -c 'echo "$PPID"' > "$MODEM_DIR/lock/pid"
+  trap 'rm -f "$MODEM_DIR/lock/pid"; rmdir "$MODEM_DIR/lock" 2>/dev/null' EXIT
+  # Network/modem failures affect only modem availability, not Wi-Fi/MWAN.
+  for TOOL in curl base64 jsonfilter; do
+    command -v "$TOOL" >/dev/null 2>&1 || { pub -r -t "$BASE/modem/availability" -m offline; exit $?; }
+  done
+  [ -r /usr/share/libubox/jshn.sh ] || { pub -r -t "$BASE/modem/availability" -m offline; exit $?; }
+  if ! modem_get; then pub -r -t "$BASE/modem/availability" -m offline; exit $?; fi
+  if [ "$(modem_field loginfo)" != ok ]; then
+    MODEM_NOW=$(date +%s)
+    MODEM_LAST=$(cat "$MODEM_DIR/login_attempt" 2>/dev/null)
+    case "$MODEM_LAST" in ''|*[!0-9]*) MODEM_LAST=0 ;; esac
+    if [ "$MODEM_LAST" -gt 0 ] && [ "$MODEM_NOW" -ge "$MODEM_LAST" ] && [ $((MODEM_NOW - MODEM_LAST)) -lt 300 ]; then
+      pub -r -t "$BASE/modem/availability" -m offline; exit $?
+    fi
+    MODEM_SECRET=$(uci -q get "$CONFIG.modem.password_b64")
+    [ -n "$MODEM_SECRET" ] || { pub -r -t "$BASE/modem/availability" -m offline; exit $?; }
+    echo "$MODEM_NOW" > "$MODEM_DIR/login_attempt"
+    MODEM_LOGIN=$(printf '%s' "$MODEM_SECRET" | curl -fsS --noproxy '*' --connect-timeout 3 --max-time 10 \
+      -b "$MODEM_DIR/cookies" -c "$MODEM_DIR/cookies" -e "http://$MODEM_HOST/" \
+      --data 'isTest=false&goformId=LOGIN' --data-urlencode 'password@-' \
+      "http://$MODEM_HOST/goform/goform_set_cmd_process" 2>/dev/null)
+    unset MODEM_SECRET
+    if [ "$(printf '%s' "$MODEM_LOGIN" | jsonfilter -e '@.result' 2>/dev/null)" != 0 ] || ! modem_get; then
+      pub -r -t "$BASE/modem/availability" -m offline; exit $?
+    fi
+  fi
+  if [ "$(modem_field loginfo)" != ok ] || [ -z "$(modem_field network_type)" ]; then
+    pub -r -t "$BASE/modem/availability" -m offline; exit $?
+  fi
+  MODEM_STATE=$(modem_normalize) || { pub -r -t "$BASE/modem/availability" -m offline; exit $?; }
+  MODEM_HASH=$(printf '%s' "$MODEM_STATE" | sha256sum | awk '{print $1}')
+  if [ "$MODEM_HASH" != "$(cat "$MODEM_DIR/state.hash" 2>/dev/null)" ]; then
+    pub -r -t "$BASE/modem/state" -m "$MODEM_STATE" || exit 1
+    printf '%s\n' "$MODEM_HASH" > "$MODEM_DIR/state.hash" || exit 1
+  fi
+  pub -r -t "$BASE/modem/availability" -m online
+)
 
 # Read the native nftables mwan3 RPC used by LuCI, including IPv6 policies.
 mwan_sections() {
@@ -558,6 +713,10 @@ do_publish() {
     FAILED=1
   fi
 
+  if ! publish_modem; then
+    FAILED=1
+  fi
+
   if ! publish_state; then
     FAILED=1
     logger -t openwrt_mqtt 'MQTT fast-state publish failed; will retry'
@@ -631,6 +790,7 @@ terminate_daemon() {
 do_daemon_session() {
   # Force a full republish on each new MQTT connection or broker recovery.
   rm -f "$STATE_HASH_FILE" "$HEARTBEAT_FILE" /tmp/openwrt_mqtt_mwan.hash
+  rm -f /tmp/openwrt_mqtt_modem/state.hash
   rm -rf "$SSID_HASH_DIR"
 
   SESSION_FIFO="/tmp/openwrt_mqtt_$$.fifo"
@@ -744,6 +904,9 @@ case "$1" in
   install)
     do_install
     ;;
+  configure-modem)
+    configure_modem
+    ;;
   discovery)
     do_discovery
     ;;
@@ -774,7 +937,8 @@ case "$1" in
     echo "OpenWrt MQTT Publisher v${VERSION}"
     ;;
   *)
-    echo "Usage: $0 install|install-service|discovery|publish|daemon|offline|cleanup-orphans|all|status|version"
+    echo "Usage: $0 install|install-service|configure-modem|discovery|publish|daemon|offline|cleanup-orphans|all|status|version"
     exit 1
     ;;
 esac
+
