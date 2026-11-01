@@ -1,7 +1,7 @@
 #!/bin/sh
 #
 # OpenWrt WiFi MQTT Publisher for Home Assistant
-# Version: 1.3.0
+# Version: 1.4.0
 #
 # Commands:
 #   /root/openwrt_mqtt.sh install
@@ -23,7 +23,7 @@
 #   /etc/init.d/openwrt_mqtt
 #
 
-VERSION="1.3.0"
+VERSION="1.4.0"
 CONFIG="openwrt_mqtt"
 SCRIPT="/root/openwrt_mqtt.sh"
 SERVICE="/etc/init.d/openwrt_mqtt"
@@ -60,6 +60,7 @@ load_config() {
   HEARTBEAT_SECONDS="$(uci -q get ${CONFIG}.@mqtt[0].heartbeat)"
   POLL_SECONDS="$(uci -q get ${CONFIG}.@mqtt[0].poll_interval)"
   MODEM_ENABLED="$(uci -q get ${CONFIG}.modem.enabled)"
+  [ -n "$MODEM_ENABLED" ] || MODEM_ENABLED=auto
   MODEM_HOST="$(uci -q get ${CONFIG}.modem.host)"
   [ -n "$MODEM_HOST" ] || MODEM_HOST=192.168.11.1
 
@@ -353,6 +354,13 @@ start_service() {
         procd_set_param stdout 1
         procd_set_param stderr 1
         procd_close_instance
+        procd_open_instance updater
+        procd_set_param command /root/openwrt_mqtt.sh update-listener
+        procd_set_param respawn 3600 5 0
+        procd_set_param term_timeout 10
+        procd_set_param stdout 1
+        procd_set_param stderr 1
+        procd_close_instance
 }
 
 service_stopped() {
@@ -420,6 +428,7 @@ do_discovery() {
 
   mwan_discovery
   modem_discovery
+  update_discovery
   [ "$DISCOVERY_FAILED" -eq 0 ]
 }
 
@@ -447,7 +456,7 @@ configure_modem() (
   unset MODEM_PASSWORD
   [ -f "/etc/config/$CONFIG" ] || { echo 'Configure MQTT with install first' >&2; exit 1; }
   chmod 600 "/etc/config/$CONFIG" || exit 1
-  printf "set %s.modem=modem\nset %s.modem.enabled='1'\nset %s.modem.host='%s'\nset %s.modem.password_b64='%s'\ncommit %s\n" "$CONFIG" "$CONFIG" "$CONFIG" "$MODEM_HOST" "$CONFIG" "$MODEM_PASSWORD_B64" "$CONFIG" | uci batch || exit 1
+  printf "set %s.modem=modem\nset %s.modem.enabled='auto'\nset %s.modem.host='%s'\nset %s.modem.password_b64='%s'\ncommit %s\n" "$CONFIG" "$CONFIG" "$CONFIG" "$MODEM_HOST" "$CONFIG" "$MODEM_PASSWORD_B64" "$CONFIG" | uci batch || exit 1
   echo 'Modem configured. Restart openwrt_mqtt to publish discovery.'
 )
 
@@ -456,8 +465,23 @@ modem_sensor() {
     -m "{\"name\":\"Mobile $2\",\"unique_id\":\"${DEVICE_ID}_modem_$1\",\"state_topic\":\"${BASE}/modem/state\",\"availability\":[{\"topic\":\"${BASE}/availability\"},{\"topic\":\"${BASE}/modem/availability\"}],\"availability_mode\":\"all\",\"value_template\":\"$(json_escape "$3")\",$4${DEVICE}}"
 }
 
+# Never query a modem reached through another router. Credentials stay local.
+modem_configured() {
+  [ "$MODEM_ENABLED" != 0 ] && [ -n "$(uci -q get "$CONFIG.modem.password_b64")" ]
+}
+
+modem_local_usb() {
+  modem_host_valid || return 1
+  MODEM_ROUTE=$(ip -4 route get "$MODEM_HOST" 2>/dev/null) || return 1
+  case " $MODEM_ROUTE " in *" via "*) return 1 ;; esac
+  MODEM_DEV=$(printf '%s\n' "$MODEM_ROUTE" | awk '{for(i=1;i<NF;i++) if($i=="dev") {print $(i+1);exit}}')
+  case "$MODEM_DEV" in ''|*[!a-zA-Z0-9_.-]*) return 1 ;; esac
+  MODEM_DEVICE_PATH=$(readlink -f "/sys/class/net/$MODEM_DEV/device") || return 1
+  case "$MODEM_DEVICE_PATH" in */usb[0-9]*/*) return 0 ;; *) return 1 ;; esac
+}
+
 modem_discovery() {
-  [ "$MODEM_ENABLED" = 1 ] || return 0
+  modem_configured || return 0
   modem_sensor network 'Network' "{{ value_json.get('network_type') or none }}" '"icon":"mdi:network",'
   modem_sensor band 'Band' "{{ value_json.get('band') or none }}" '"icon":"mdi:antenna",'
   modem_sensor signal 'Signal RSRP' "{{ value_json.get('lte_rsrp') }}" '"device_class":"signal_strength","unit_of_measurement":"dBm","state_class":"measurement",'
@@ -516,11 +540,11 @@ modem_normalize() (
 )
 
 publish_modem() (
-  if [ "$MODEM_ENABLED" != 1 ]; then
+  if ! modem_configured; then
     if [ -d /tmp/openwrt_mqtt_modem ] || [ "$(uci -q get "$CONFIG.modem")" = modem ]; then pub -r -t "$BASE/modem/availability" -m offline; else return 0; fi
     exit $?
   fi
-  modem_host_valid || { pub -r -t "$BASE/modem/availability" -m offline; exit $?; }
+  modem_local_usb || { pub -r -t "$BASE/modem/availability" -m offline; exit $?; }
   MODEM_DIR=/tmp/openwrt_mqtt_modem
   umask 077
   [ ! -L "$MODEM_DIR" ] || exit 1
@@ -623,6 +647,148 @@ publish_mwan() {
     printf '%s\n' "$MW_HASH" > /tmp/openwrt_mqtt_mwan.hash || return 1
   fi
   pub -r -t "${BASE}/mwan3/availability" -m online
+}
+
+# Fixed HTTPS repository source. An MQTT command can never supply a URL or code.
+UPDATE_ROOT=https://raw.githubusercontent.com/JCalvi/openwrt-mqtt-haos
+UPDATE_DIR=/tmp/openwrt_mqtt_update
+
+install_update_dependencies() {
+  apk add curl ca-bundle jsonfilter mosquitto-client-nossl
+}
+
+update_discovery() {
+  discovery_pub -r -t "$DISC/update/${DEVICE_ID}/publisher/config" -m "{\"name\":\"MQTT Publisher\",\"unique_id\":\"${DEVICE_ID}_publisher_update\",\"state_topic\":\"$BASE/update/state\",\"command_topic\":\"$BASE/update/install\",\"payload_install\":\"INSTALL\",\"retain\":false,\"entity_category\":\"config\",\"availability_topic\":\"$BASE/availability\",$DEVICE}"
+  discovery_pub -r -t "$DISC/sensor/${DEVICE_ID}/publisher_update_status/config" -m "{\"name\":\"Publisher Update Status\",\"unique_id\":\"${DEVICE_ID}_publisher_update_status\",\"state_topic\":\"$BASE/update/state\",\"value_template\":\"{{ value_json.status }}\",\"entity_category\":\"diagnostic\",\"availability_topic\":\"$BASE/availability\",$DEVICE}"
+}
+
+update_state() {
+  # Versions and commit are validated before use; all other strings are constants.
+  pub -r -q 1 -t "$BASE/update/state" -m "{\"installed_version\":\"$VERSION\",\"latest_version\":\"${UPDATE_VERSION:-$VERSION}\",\"in_progress\":$2,\"title\":\"OpenWrt MQTT Publisher\",\"release_url\":\"https://github.com/JCalvi/openwrt-mqtt-haos\",\"release_summary\":\"Updates the publisher script only; router firmware and settings are preserved.\",\"status\":\"$1\"}"
+}
+
+update_dir() {
+  umask 077
+  [ ! -L "$UPDATE_DIR" ] || return 1
+  mkdir -p "$UPDATE_DIR" && chmod 700 "$UPDATE_DIR"
+}
+
+update_manifest() {
+  UPDATE_VERSION=$(jsonfilter -i "$1" -e '@.version') || return 1
+  UPDATE_COMMIT=$(jsonfilter -i "$1" -e '@.commit') || return 1
+  UPDATE_SHA=$(jsonfilter -i "$1" -e '@.sha256') || return 1
+  printf '%s\n' "$UPDATE_VERSION" | LC_ALL=C grep -Eq '^[0-9]{1,4}\.[0-9]{1,4}\.[0-9]{1,4}$' || return 1
+  [ "${#UPDATE_COMMIT}" = 40 ] && [ "${#UPDATE_SHA}" = 64 ] || return 1
+  case "$UPDATE_COMMIT$UPDATE_SHA" in *[!0-9a-f]*) return 1 ;; esac
+}
+
+update_newer() {
+  awk -v new="$UPDATE_VERSION" -v old="$VERSION" 'BEGIN {
+    split(new,n,"."); split(old,o,"."); for(i=1;i<=3;i++) {
+      if(n[i]+0>o[i]+0) exit 0; if(n[i]+0<o[i]+0) exit 1
+    } exit 1
+  }'
+}
+
+update_download() {
+  # Certificate validation is mandatory; never use -k or fall back to HTTP.
+  curl -fSs --proto '=https' --tlsv1.2 --connect-timeout 5 --max-time 30 \
+    --max-filesize "$3" "$1" -o "$2"
+}
+
+update_operation() (
+  update_dir || exit 1
+  if ! mkdir "$UPDATE_DIR/lock" 2>/dev/null; then
+    UPDATE_OWNER=$(cat "$UPDATE_DIR/lock/pid" 2>/dev/null)
+    case "$UPDATE_OWNER" in ''|*[!0-9]*) exit 1 ;; esac
+    kill -0 "$UPDATE_OWNER" 2>/dev/null && exit 1
+    rm -f "$UPDATE_DIR/lock/pid"
+    rmdir "$UPDATE_DIR/lock" && mkdir "$UPDATE_DIR/lock" || exit 1
+  fi
+  sh -c 'echo "$PPID"' > "$UPDATE_DIR/lock/pid"
+  UPDATE_WORK=$(mktemp -d "$UPDATE_DIR/work.XXXXXX") || { rm -f "$UPDATE_DIR/lock/pid"; rmdir "$UPDATE_DIR/lock" 2>/dev/null; exit 1; }
+  UPDATE_CANDIDATE=""
+  trap 'rm -rf "$UPDATE_WORK"; [ -z "$UPDATE_CANDIDATE" ] || rm -f "$UPDATE_CANDIDATE"; rm -f "$UPDATE_DIR/lock/pid"; rmdir "$UPDATE_DIR/lock" 2>/dev/null' EXIT
+  trap 'exit 1' TERM INT HUP
+  date +%s > "$UPDATE_DIR/last_check"
+  if ! update_download "$UPDATE_ROOT/main/release.json" "$UPDATE_WORK/manifest" 4096 || ! update_manifest "$UPDATE_WORK/manifest"; then
+    UPDATE_VERSION=$VERSION
+    update_state 'Check failed' false
+    exit 1
+  fi
+  cp "$UPDATE_WORK/manifest" "$UPDATE_DIR/manifest"
+  if ! update_newer; then UPDATE_VERSION=$VERSION; update_state 'Up to date' false; exit $?; fi
+  if [ "$1" != install ]; then update_state 'Checked' false; exit $?; fi
+  update_state 'Installing' true || exit 1
+  if ! update_download "$UPDATE_ROOT/$UPDATE_COMMIT/openwrt_mqtt.sh" "$UPDATE_WORK/script" 262144; then
+    update_state 'Download failed' false; exit 1
+  fi
+  if [ "$(sha256sum "$UPDATE_WORK/script" | awk '{print $1}')" != "$UPDATE_SHA" ] || ! sh -n "$UPDATE_WORK/script" || ! grep -Fqx "VERSION=\"$UPDATE_VERSION\"" "$UPDATE_WORK/script"; then
+    update_state 'Validation failed' false; exit 1
+  fi
+  # Atomic replacement on the same filesystem; keep the previous script.
+  if [ -L "$SCRIPT" ] || [ ! -f "$SCRIPT" ] || [ -L "$SCRIPT.bak" ]; then
+    update_state 'Unsafe install path' false; exit 1
+  fi
+  UPDATE_CANDIDATE=$(mktemp "${SCRIPT}.new.XXXXXX") || exit 1
+  if ! cp "$UPDATE_WORK/script" "$UPDATE_CANDIDATE" || ! chmod 700 "$UPDATE_CANDIDATE" || ! cp -p "$SCRIPT" "$SCRIPT.bak" || ! mv -f "$UPDATE_CANDIDATE" "$SCRIPT"; then
+    update_state 'Install failed' false; exit 1
+  fi
+  UPDATE_CANDIDATE=""
+  update_state 'Installed; restarting publisher' true
+  # procd respawns only the telemetry daemon; the updater refreshes itself below.
+  for UPDATE_PROC in /proc/[0-9]*; do
+    UPDATE_PID=${UPDATE_PROC#/proc/}
+    if (is_our_daemon_pid "$UPDATE_PID"); then kill -TERM "$UPDATE_PID" 2>/dev/null || true; fi
+  done
+)
+
+publish_update() (
+  command -v curl >/dev/null 2>&1 && command -v jsonfilter >/dev/null 2>&1 || exit 0
+  update_dir || exit 0
+  # Do not overwrite install progress with a periodic check.
+  [ ! -d "$UPDATE_DIR/lock" ] || exit 0
+  UPDATE_LAST=$(cat "$UPDATE_DIR/last_check" 2>/dev/null)
+  case "$UPDATE_LAST" in ''|*[!0-9]*) UPDATE_LAST=0 ;; esac
+  UPDATE_NOW=$(date +%s)
+  if [ $((UPDATE_NOW - UPDATE_LAST)) -ge 21600 ] || [ "$UPDATE_NOW" -lt "$UPDATE_LAST" ]; then
+    update_operation check && printf '%s\n' "$VERSION" > "$UPDATE_DIR/published_version"
+  elif [ "$(cat "$UPDATE_DIR/published_version" 2>/dev/null)" != "$VERSION" ] && [ -f "$UPDATE_DIR/manifest" ] && update_manifest "$UPDATE_DIR/manifest"; then
+    update_state 'Checked' false && printf '%s\n' "$VERSION" > "$UPDATE_DIR/published_version"
+  fi
+)
+
+update_listener() {
+  load_config
+  update_dir || exit 1
+  UPDATE_COMMAND=$(mktemp "$UPDATE_DIR/command.XXXXXX") || exit 1
+  UPDATE_SUB_PID=""
+  trap '[ -z "$UPDATE_SUB_PID" ] || kill "$UPDATE_SUB_PID" 2>/dev/null; [ -z "$UPDATE_SUB_PID" ] || wait "$UPDATE_SUB_PID" 2>/dev/null; rm -f "$UPDATE_COMMAND"; exit 0' TERM INT HUP
+  while :; do
+    # -R ignores retained commands: reconnecting never installs an old request.
+    mosquitto_sub -h "$MQTT_HOST" -u "$MQTT_USER" -P "$MQTT_PASS" -q 1 -R -C 1 \
+      -t "$BASE/update/install" > "$UPDATE_COMMAND" &
+    UPDATE_SUB_PID=$!
+    wait "$UPDATE_SUB_PID"
+    UPDATE_SUB_RESULT=$?
+    UPDATE_SUB_PID=""
+    if [ "$UPDATE_SUB_RESULT" = 0 ] && [ "$(cat "$UPDATE_COMMAND")" = INSTALL ]; then
+      update_operation install &
+      UPDATE_SUB_PID=$!
+      wait "$UPDATE_SUB_PID"
+      UPDATE_INSTALL_RESULT=$?
+      UPDATE_SUB_PID=""
+      if [ "$UPDATE_INSTALL_RESULT" = 0 ]; then
+        rm -f "$UPDATE_COMMAND"
+        exec "$SCRIPT" update-listener
+      fi
+    fi
+    # Bounded retry, also preventing an invalid-command flood from spinning.
+    sleep 5 &
+    UPDATE_SUB_PID=$!
+    wait "$UPDATE_SUB_PID" || true
+    UPDATE_SUB_PID=""
+  done
 }
 
 build_state() {
@@ -744,6 +910,8 @@ session_producer() {
   trap 'if [ -n "$PRODUCER_SLEEP_PID" ]; then kill "$PRODUCER_SLEEP_PID" 2>/dev/null || true; fi; exit 0' TERM INT HUP
 
   if do_discovery && do_publish; then
+    publish_update || true
+    UPDATE_CHECK_AFTER=$((NOW + 21600))
     printf 'online\n' || return 1
   else
     logger -t openwrt_mqtt 'Initial MQTT telemetry failed; reconnecting'
@@ -758,6 +926,10 @@ session_producer() {
     PRODUCER_SLEEP_PID=""
 
     if do_publish; then
+      if [ "$NOW" -ge "$UPDATE_CHECK_AFTER" ]; then
+        publish_update || true
+        UPDATE_CHECK_AFTER=$((NOW + 21600))
+      fi
       printf 'online\n' || return 1
     else
       logger -t openwrt_mqtt 'MQTT telemetry failed; marking unavailable and reconnecting'
@@ -789,7 +961,7 @@ terminate_daemon() {
 
 do_daemon_session() {
   # Force a full republish on each new MQTT connection or broker recovery.
-  rm -f "$STATE_HASH_FILE" "$HEARTBEAT_FILE" /tmp/openwrt_mqtt_mwan.hash
+  rm -f "$STATE_HASH_FILE" "$HEARTBEAT_FILE" /tmp/openwrt_mqtt_mwan.hash "$UPDATE_DIR/published_version"
   rm -f /tmp/openwrt_mqtt_modem/state.hash
   rm -rf "$SSID_HASH_DIR"
 
@@ -858,6 +1030,7 @@ do_install() {
     echo ""
   fi
 
+  install_update_dependencies || exit 1
   chmod +x "$SCRIPT"
   create_config
   create_service || exit 1
@@ -931,13 +1104,22 @@ case "$1" in
     ;;
   install-service)
     # Noninteractive upgrade, preserving /etc/config/openwrt_mqtt unchanged.
-    create_service || exit 1
+    install_update_dependencies && create_service || exit 1
+    ;;
+  check-update)
+    load_config; update_operation check
+    ;;
+  update)
+    load_config; update_operation install
+    ;;
+  update-listener)
+    update_listener
     ;;
   version)
     echo "OpenWrt MQTT Publisher v${VERSION}"
     ;;
   *)
-    echo "Usage: $0 install|install-service|configure-modem|discovery|publish|daemon|offline|cleanup-orphans|all|status|version"
+    echo "Usage: $0 install|install-service|configure-modem|check-update|update|discovery|publish|daemon|offline|cleanup-orphans|all|status|version"
     exit 1
     ;;
 esac
