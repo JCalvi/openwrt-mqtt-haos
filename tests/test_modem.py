@@ -74,6 +74,7 @@ curl() {
    else printf '{"loginfo":"timeout","network_type":"LTE"}' > "$MODEM_DIR/response"; fi ;;
  esac
 }
+modem_local_usb() { return 0; }
 modem_discovery
 publish_modem || exit 10
 publish_modem || exit 11
