@@ -1,14 +1,37 @@
 # openwrt-mqtt-haos
 
-**Version 1.3.0** — publishes OpenWrt Wi-Fi, system, MWAN and optional ZTE MF833V mobile-modem readings to Home Assistant using MQTT discovery.
+**Version 1.4.0** — publishes OpenWrt Wi-Fi, system, MWAN and optional ZTE MF833V mobile-modem readings to Home Assistant using MQTT discovery.
 
 Tested on GL-MT6000 running Alpine-based OpenWrt.
+
+## v1.4.0: automatic local modem detection and HA updates
+
+The same script can run on all routers. Modem polling requires saved modem credentials and a **direct IPv4 route to a network device with USB sysfs ancestry**. A route through another gateway is rejected. No password is copied between routers. `configure-modem` now selects `enabled='auto'`; existing `enabled='1'` configurations also receive the local USB check. `enabled='0'` explicitly disables polling. Routers without credentials skip modem discovery and polling. Previously configured modem entities become unavailable while the USB modem is absent and recover at the next normal poll when reconnected. Detection does not change routes, firewall rules or failover settings.
+
+Each router gets an **MQTT Publisher** Update entity and a **Publisher Update Status** diagnostic sensor in its existing Home Assistant device. The entity reports installed/latest publisher versions and provides HA's manual Install control when a newer version is available. It updates this script, **not OpenWrt firmware**. There are no automatic installations. Each router must first receive v1.4.0 and the updated init service using the one-time upgrade procedure below; v1.3.0 cannot update itself from HA.
+
+Version checks use a small HTTPS manifest every six hours. A persistent MQTT subscriber waits for commands without polling; normal Wi-Fi/modem telemetry remains at its existing interval. Between version checks, cached state avoids JSON parsing and extra MQTT update publications. These changes aim to keep idle overhead small; exact CPU usage has not been measured on the routers and is not guaranteed unchanged.
+
+An Install request re-fetches `release.json`, accepts only a newer numeric version, downloads from the manifest's immutable repository commit, and validates the SHA-256, shell syntax and embedded version. It then atomically replaces the script, saves the previous file as `/root/openwrt_mqtt.sh.bak`, and signals the telemetry daemon for procd to respawn. The updater reloads its new code too. A failed download or validation leaves the installed script unchanged and reports failure. This is not a signed release or automatic runtime rollback: HTTPS and repository access are the trust boundary. Restore the backup manually if a validated release has a runtime defect.
+
+Only the exact non-retained MQTT payload `INSTALL` on `openwrt/{id}/update/install` is accepted. No command-supplied URL or shell text is executed. Restrict broker write access to these command topics to trusted HA/admin accounts: this authorizes a root-owned script update. Keep the repository's `release.json` pinned to the tested script commit and hash, publishing it only after tests pass. Future releases requiring new packages or service changes need an explicit migration; this updater replaces the publisher script only.
+
+The noninteractive `install-service` command installs `curl`, `ca-bundle`, `jsonfilter` and `mosquitto-client-nossl`, preserving UCI settings, then creates both supervised service instances. Internet access is needed for release checks and updates. An unreachable repository does not stop telemetry. Existing firewall restrictions remain effective.
+
+Manual alternatives:
+
+```sh
+/root/openwrt_mqtt.sh check-update
+/root/openwrt_mqtt.sh update
+```
+
+After installing on each router, check its HA device for **MQTT Publisher**. The first release check runs at startup; later checks are six hours apart. An update entity in HA is the manual update control, rather than a separate dashboard button. You can add the entity to your dashboard.
 
 ## v1.3.0: ZTE MF833V signal, band and data usage
 
 Optional modem monitoring adds **10 sensors** to the hosting router's MQTT device: Mobile Network, Band, Signal RSRP (dBm), Signal Bars (0–5), and download/upload/total data for both the current connection session and the modem's monthly counters. Band `LTE BAND 3` is displayed as `B3`. MQTT carries byte counters; discovery templates convert to decimal GB for HA statistics and display (two decimal places).
 
-Enable **only on the router physically hosting the dongle**, e.g. GL-MT6000-Upstairs. VM101 can continue publishing MWAN status separately. Existing entities, topics and credentials remain unchanged. Monitoring is disabled by default, makes no routing changes and does not alter modem settings.
+Configure credentials **only on the router physically hosting the dongle**, e.g. GL-MT6000-Upstairs. VM101 can continue publishing MWAN status separately. Existing entities, topics and credentials remain unchanged. Monitoring is skipped without credentials or a directly attached USB device; it makes no routing changes and does not alter modem settings.
 
 After updating the script using the upgrade instructions below:
 
@@ -280,6 +303,8 @@ logread | grep openwrt_mqtt
 |---------|-------------|
 | `install` | Full interactive install: deps, config, service, discovery, publish |
 | `install-service` | Noninteractive service update; enables procd, maintains sysupgrade preservation and rc.local boot fallback |
+| `check-update` | Check the pinned publisher release and publish update state |
+| `update` | Manually install a validated newer publisher release |
 | `offline` | Publish retained `offline` (used by the service on clean stop) |
 | `discovery` | Re-publish MQTT discovery payloads (run after adding a new SSID) |
 | `publish` | Publish current state once and exit |
